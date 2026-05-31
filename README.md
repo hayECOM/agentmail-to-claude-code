@@ -131,8 +131,17 @@ shells out to this script the raw image bytes never pass through its LLM context
 (the agent passes a file path, not the pixels). Both the API key and the sending
 inbox come from the environment; nothing is hardcoded.
 
-This is how an agent can hand work to a Claude Code session by email: it sends a
-task to the inbox, the daemon opens a session, and Claude gets to work.
+### How Hermes uses it
+
+This is exactly how Hermes, my autonomous agent, hands work to Claude Code.
+Hermes runs on its own AgentMail inbox, and when it wants Claude to pick up a
+task it emails the watched inbox with a sender like the one above, then the
+daemon opens a session and Claude gets to work. One agent dispatching another,
+over plain email.
+
+The in-process base64 is the reason it's a separate script rather than inline
+code: Hermes can attach a screenshot to a task without the image bytes ever
+entering its own LLM context, it just hands the sender a file path.
 
 ## Tests
 
