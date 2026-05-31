@@ -10,8 +10,9 @@ Send an email to the watched inbox and Claude Code starts working on whatever's
 in the subject and body, with any attachments available to it by path.
 
 The point: because the trigger is just an email, you can put Claude Code to work
-on your own computer from anywhere. I drive it through my agent, Hermes, from my
-phone, no VPN or SSH into the machine. See [How I use it with Hermes](#how-i-use-it-with-hermes).
+on your own computer from anywhere. I've wired it to a `cc` command in my agent
+Hermes, so from my phone I run `cc <task>` and it lands as a working session on
+my Mac, no VPN or SSH into the machine. See [How I use it with Hermes](#how-i-use-it-with-hermes).
 
 It drives either terminal:
 
@@ -137,15 +138,15 @@ inbox come from the environment; nothing is hardcoded.
 
 ### How I use it with Hermes
 
-This is how I put Claude Code to work on my own computer from anywhere. Hermes
-is my agent, and I can reach it from my phone. When I want something done on my
-Mac, I tell Hermes, Hermes emails the watched inbox with a sender like the one
-above, and the daemon spins up a Claude Code session right there on my machine
-and starts working. No VPN, no SSH into the box, just email.
+I've wired the sender up as a `cc` command in Hermes, my agent, so dispatching
+to my desktop is one shot. From my phone I run `cc <task>` and Hermes fires the
+email to my main computer's inbox; the daemon spins up a Claude Code session
+right there on the Mac and starts working. No VPN, no SSH into the box, just a
+command that turns into an email.
 
-The in-process base64 is why the sender is a separate script: I can have Hermes
-attach a screenshot to the task without the image bytes ever entering its LLM
-context, it just passes the sender a file path.
+The in-process base64 is why the sender is a separate script: I can hand `cc` a
+screenshot and Hermes attaches it to the task without the image bytes ever
+entering its LLM context, it just passes a file path.
 
 ## Tests
 
