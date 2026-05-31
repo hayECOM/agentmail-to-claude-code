@@ -113,6 +113,27 @@ Reload after editing the daemon:
 launchctl kickstart -k gui/$(id -u)/com.agentmail.cc
 ```
 
+## Sending a task to the inbox
+
+The daemon reacts to inbound mail, so anything that can email the watched inbox
+from an allowlisted address can hand Claude Code a task: another agent, a cron
+job, a shortcut, your phone. `examples/send_task.py` is a minimal sender built
+on the AgentMail REST API:
+
+```bash
+AGENTMAIL_API_KEY=... AGENTMAIL_SEND_INBOX=your-agent@agentmail.to \
+  python3 examples/send_task.py you@agentmail.to "Resize these" "Crop to 1:1" ~/Desktop/pic.png
+```
+
+The sending inbox must be listed in the daemon's `CC_ALLOWED_FROM`. An optional
+image is attached as base64 that's read and encoded in-process, so when an agent
+shells out to this script the raw image bytes never pass through its LLM context
+(the agent passes a file path, not the pixels). Both the API key and the sending
+inbox come from the environment; nothing is hardcoded.
+
+This is how an agent can hand work to a Claude Code session by email: it sends a
+task to the inbox, the daemon opens a session, and Claude gets to work.
+
 ## Tests
 
 ```bash
@@ -132,3 +153,4 @@ launchctl kickstart -k gui/$(id -u)/com.agentmail.cc
 - `test_cc_daemon.py` - unit tests
 - `com.agentmail.cc.plist.example` - launchd job template
 - `cc.env.example` - env template
+- `examples/send_task.py` - minimal sender to trigger the daemon from any allowlisted inbox
