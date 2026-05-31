@@ -1,0 +1,13 @@
+cc.env
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Runtime data (default CC_HOME is outside the repo, but ignore these too in
+# case CC_HOME is pointed at the working tree).
+.agentmail-cc/
+attachments/
+prompts/
+*.log

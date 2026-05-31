@@ -1,0 +1,134 @@
+# agentmail-to-claude-code
+
+Email gateway for [Claude Code](https://claude.com/claude-code). Subscribe an
+[AgentMail](https://agentmail.to) inbox over WebSocket; on every authenticated,
+allowlisted message the daemon opens a fresh Claude Code session in your
+terminal, writes the email to a prompt file, and tells Claude to read and act
+on it.
+
+Send an email to the watched inbox and Claude Code starts working on whatever's
+in the subject and body, with any attachments available to it by path.
+
+It drives either terminal:
+
+- **cmux** ([cmux.com](https://cmux.com)) via its Unix-socket control plane, or
+- **standalone Ghostty** ([ghostty.org](https://ghostty.org)) via AppleScript.
+
+Pick one with `CC_TERMINAL` in your env.
+
+## How it works
+
+1. `cc-daemon.py` connects to AgentMail's WebSocket and subscribes to `AGENTMAIL_INBOX`.
+2. On `MessageReceivedEvent`, the handler drops any message whose sender isn't in `CC_ALLOWED_FROM` or that failed DKIM/SPF.
+3. Attachments are downloaded under `CC_HOME/attachments/<message-id>/`. Per-attachment failures log a warning and continue.
+4. A prompt is built from `From:`, `Subject:`, the body, and a footer listing every downloaded attachment by absolute path. It's written to `CC_HOME/prompts/<message-id>.md`.
+5. The selected backend opens a new Claude Code session and sends a single-line pointer telling Claude to read and act on the prompt file:
+   - **cmux:** `surface.create` (auto-launches Claude Code via the Ghostty config cmux reads) -> poll `surface.read_text` until ready -> `surface.send_text` the pointer -> `surface.send_key enter`. Every call targets a specific `surface_id`, so concurrent emails never collide.
+   - **ghostty:** `osascript` activates Ghostty and opens a new tab (Ghostty auto-launches Claude Code in new tabs), then pastes the pointer via the clipboard and presses Return.
+6. The message is marked read via the AgentMail REST API.
+
+The email is referenced by file path rather than typed inline, which keeps multi-line bodies intact across both backends. Image attachments are read by Claude with the Read tool from the paths in the prompt file.
+
+## Requirements
+
+- macOS (AppleScript, launchd)
+- Python 3.12+
+- An [AgentMail](https://agentmail.to) account with an inbox-scoped API key
+- One of:
+  - **cmux** installed, or
+  - **Ghostty** installed
+- Claude Code, configured to auto-launch in a new terminal session (see your chosen backend below)
+
+## Setup
+
+```bash
+git clone https://github.com/mvanhorn/agentmail-to-claude-code.git
+cd agentmail-to-claude-code
+python3 -m venv venv
+./venv/bin/pip install agentmail httpx pytest
+
+cp cc.env.example cc.env
+$EDITOR cc.env   # fill in AGENTMAIL_API_KEY, AGENTMAIL_INBOX, CC_ALLOWED_FROM, CC_TERMINAL
+chmod 600 cc.env
+
+# Verify it subscribes
+./run-daemon.sh
+```
+
+`CC_ALLOWED_FROM` is the gate on who can drive your machine. Keep it to addresses you control. Mail from anyone else, or anything that fails DKIM/SPF, is dropped before a session is ever opened.
+
+## Choose your terminal
+
+The daemon needs your terminal to start Claude Code automatically when a new session opens. Both backends rely on a small launcher script so Claude restarts cleanly if it exits:
+
+```bash
+# ~/.local/bin/claude-launcher.sh
+#!/bin/zsh
+caffeinate -dimsu -- claude --dangerously-skip-permissions
+echo "Claude exited. Type 'claude' to relaunch or 'exit' to close."
+exec /bin/zsh -li
+```
+
+```bash
+chmod +x ~/.local/bin/claude-launcher.sh
+```
+
+`--dangerously-skip-permissions` lets the emailed task run without prompting. Only use it on a machine and inbox you trust, with a tight `CC_ALLOWED_FROM`.
+
+### Option A: cmux
+
+cmux runs Ghostty surfaces and reads `~/.config/ghostty/config`, so point Ghostty's `command` at the launcher:
+
+```
+# ~/.config/ghostty/config
+command = /Users/YOUR_USERNAME/.local/bin/claude-launcher.sh
+```
+
+Set `CC_TERMINAL=cmux` in `cc.env`. The daemon calls the cmux CLI by absolute path; if cmux isn't at the default location, set `CMUX_BIN`. Same-user local socket calls resolve the saved cmux Settings password automatically.
+
+### Option B: standalone Ghostty
+
+Configure Ghostty to launch the launcher in new tabs:
+
+```
+# ~/.config/ghostty/config
+command = /Users/YOUR_USERNAME/.local/bin/claude-launcher.sh
+```
+
+Set `CC_TERMINAL=ghostty` in `cc.env`. The Ghostty backend uses AppleScript and System Events, so grant your terminal/automation Accessibility permission under System Settings -> Privacy & Security -> Accessibility.
+
+## Install as a launchd job
+
+```bash
+# Point the plist at this repo
+sed "s#__INSTALL_DIR__#$(pwd)#g" com.agentmail.cc.plist.example > ~/Library/LaunchAgents/com.agentmail.cc.plist
+
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentmail.cc.plist
+launchctl kickstart gui/$(id -u)/com.agentmail.cc
+```
+
+Reload after editing the daemon:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.agentmail.cc
+```
+
+## Tests
+
+```bash
+./venv/bin/pytest test_cc_daemon.py -v
+```
+
+## Security notes
+
+- The API key lives only in `cc.env` (gitignored). It is never committed.
+- `CC_ALLOWED_FROM` plus AgentMail's DKIM/SPF labeling is the trust boundary. A new Claude Code session is opened only for allowlisted, authenticated senders.
+- Sessions run `claude --dangerously-skip-permissions`. Treat the watched inbox as a remote control for your machine and scope the allowlist accordingly.
+
+## Files
+
+- `cc-daemon.py` - the daemon (both backends)
+- `run-daemon.sh` - sources `cc.env` and execs the daemon
+- `test_cc_daemon.py` - unit tests
+- `com.agentmail.cc.plist.example` - launchd job template
+- `cc.env.example` - env template
