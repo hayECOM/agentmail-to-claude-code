@@ -9,6 +9,10 @@ on it.
 Send an email to the watched inbox and Claude Code starts working on whatever's
 in the subject and body, with any attachments available to it by path.
 
+The point: because the trigger is just an email, you can put Claude Code to work
+on your own computer from anywhere. I drive it through my agent, Hermes, from my
+phone, no VPN or SSH into the machine. See [How I use it with Hermes](#how-i-use-it-with-hermes).
+
 It drives either terminal:
 
 - **cmux** ([cmux.com](https://cmux.com)) via its Unix-socket control plane, or
@@ -131,17 +135,17 @@ shells out to this script the raw image bytes never pass through its LLM context
 (the agent passes a file path, not the pixels). Both the API key and the sending
 inbox come from the environment; nothing is hardcoded.
 
-### How Hermes uses it
+### How I use it with Hermes
 
-This is exactly how Hermes, my autonomous agent, hands work to Claude Code.
-Hermes runs on its own AgentMail inbox, and when it wants Claude to pick up a
-task it emails the watched inbox with a sender like the one above, then the
-daemon opens a session and Claude gets to work. One agent dispatching another,
-over plain email.
+This is how I put Claude Code to work on my own computer from anywhere. Hermes
+is my agent, and I can reach it from my phone. When I want something done on my
+Mac, I tell Hermes, Hermes emails the watched inbox with a sender like the one
+above, and the daemon spins up a Claude Code session right there on my machine
+and starts working. No VPN, no SSH into the box, just email.
 
-The in-process base64 is the reason it's a separate script rather than inline
-code: Hermes can attach a screenshot to a task without the image bytes ever
-entering its own LLM context, it just hands the sender a file path.
+The in-process base64 is why the sender is a separate script: I can have Hermes
+attach a screenshot to the task without the image bytes ever entering its LLM
+context, it just passes the sender a file path.
 
 ## Tests
 
