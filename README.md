@@ -148,6 +148,26 @@ The in-process base64 is why the sender is a separate script: I can hand `cc` a
 screenshot and Hermes attaches it to the task without the image bytes ever
 entering its LLM context, it just passes a file path.
 
+### Giving an agent its own inbox
+
+The sending agent needs its own AgentMail inbox. An agent can sign itself up,
+no console clicking, via the SDK's agent flow (a one-time code lands in your
+email to verify):
+
+```python
+from agentmail import AgentMail
+client = AgentMail()
+client.agent.sign_up(human_email="you@example.com", username="my-agent")
+client.agent.verify(otp_code="123456")          # code from the email
+inbox = client.inboxes.create(display_name="My Agent")  # -> my-agent@agentmail.to
+```
+
+Or just point a coding agent at AgentMail's agent docs and let it do the whole
+thing: "read https://docs.agentmail.to/llms.txt and make yourself an email
+address." There's also an MCP server (`npx -y agentmail-mcp`) for tool-based
+clients. Add the new inbox to the daemon's `CC_ALLOWED_FROM` so it's allowed to
+dispatch.
+
 ## Tests
 
 ```bash
