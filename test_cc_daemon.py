@@ -200,5 +200,80 @@ def test_dispatch_aborts_when_open_fails(monkeypatch, tmp_path):
         raise RuntimeError("no socket")
 
     monkeypatch.setattr(daemon, "BACKENDS", {"cmux": (boom, lambda h, p: sent.append(p))})
-    daemon.dispatch_to_claude_code("p", "a@example.com", "m3")
+    result = daemon.dispatch_to_claude_code("p", "a@example.com", "m3")
     assert sent == []
+    assert result is False
+
+
+def test_dispatch_returns_true_on_success(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon, "PROMPT_ROOT", tmp_path / "prompts")
+    monkeypatch.setattr(daemon, "TERMINAL", "cmux")
+    monkeypatch.setattr(daemon, "BACKENDS", {"cmux": (lambda: "SID", lambda h, p: None)})
+    assert daemon.dispatch_to_claude_code("p", "a@example.com", "m4") is True
+
+
+def test_dispatch_unknown_terminal_returns_false(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon, "PROMPT_ROOT", tmp_path / "prompts")
+    monkeypatch.setattr(daemon, "TERMINAL", "wezterm")
+    monkeypatch.setattr(daemon, "BACKENDS", {"cmux": (lambda: "SID", lambda h, p: None)})
+    assert daemon.dispatch_to_claude_code("p", "a@example.com", "m5") is False
+
+
+class _FakeMessages:
+    def __init__(self):
+        self.updated = []
+        self.replied = []
+
+    def update(self, **kw):
+        self.updated.append(kw)
+
+    def reply(self, **kw):
+        self.replied.append(kw)
+
+
+class _FakeInboxes:
+    def __init__(self):
+        self.messages = _FakeMessages()
+
+
+class _FakeClient:
+    def __init__(self):
+        self.inboxes = _FakeInboxes()
+
+
+class _Msg:
+    def __init__(self):
+        self.message_id = "<m-h@x>"
+        self.subject = "do a thing"
+        self.text = "body"
+        self.labels = ["received", "unread"]
+        self.attachments = []
+        self.from_ = "Allowed <a@example.com>"
+
+
+class _Ev:
+    def __init__(self):
+        self.message = _Msg()
+
+
+def _prep_handle(monkeypatch, tmp_path, ok):
+    monkeypatch.setattr(daemon, "PROMPT_ROOT", tmp_path / "prompts")
+    monkeypatch.setattr(daemon, "ALLOWED_FROM", {"a@example.com"})
+    monkeypatch.setattr(daemon, "download_attachments", lambda *a: [])
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: ok)
+
+
+def test_handle_marks_read_only_on_success(monkeypatch, tmp_path):
+    _prep_handle(monkeypatch, tmp_path, ok=True)
+    client = _FakeClient()
+    daemon.handle_message(client, _Ev())
+    assert client.inboxes.messages.updated and not client.inboxes.messages.replied
+
+
+def test_handle_leaves_unread_and_replies_on_failure(monkeypatch, tmp_path):
+    _prep_handle(monkeypatch, tmp_path, ok=False)
+    client = _FakeClient()
+    daemon.handle_message(client, _Ev())
+    # not marked read; a failure reply was bounced back instead.
+    assert not client.inboxes.messages.updated
+    assert client.inboxes.messages.replied

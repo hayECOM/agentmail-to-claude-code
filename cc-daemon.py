@@ -60,6 +60,11 @@ CMUX_BIN = os.environ.get(
 # Substring printed in a fresh Claude Code surface once it is ready for input.
 CLAUDE_READY_MARKER = "bypass permissions on"
 CLAUDE_READY_TIMEOUT_S = int(os.environ.get("CC_READY_TIMEOUT", "25"))
+# surface.create can fail with a transient "Broken pipe" when cmux's control
+# plane is briefly unresponsive (mid-restart, recovering from a crash). Retry a
+# few times with backoff before giving up so a flaky cmux self-heals.
+SURFACE_CREATE_ATTEMPTS = int(os.environ.get("CC_SURFACE_CREATE_ATTEMPTS", "4"))
+SURFACE_CREATE_BACKOFF_S = int(os.environ.get("CC_SURFACE_CREATE_BACKOFF", "3"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -218,7 +223,22 @@ def _surface_text(surface_id: str) -> str:
 
 
 def _cmux_open_session() -> str:
-    resp = _cmux_rpc("surface.create")
+    resp = None
+    for attempt in range(1, SURFACE_CREATE_ATTEMPTS + 1):
+        try:
+            resp = _cmux_rpc("surface.create")
+            break
+        except subprocess.CalledProcessError as e:
+            stderr = getattr(e, "stderr", "") or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode().strip()
+            if attempt == SURFACE_CREATE_ATTEMPTS:
+                raise
+            log.warning(
+                "surface.create failed (attempt %d/%d), retrying in %ds: %s %s",
+                attempt, SURFACE_CREATE_ATTEMPTS, SURFACE_CREATE_BACKOFF_S, e, stderr,
+            )
+            time.sleep(SURFACE_CREATE_BACKOFF_S)
     surface_id = resp.get("surface_id")
     if not surface_id:
         raise RuntimeError(f"surface.create returned no surface_id: {resp!r}")
@@ -257,7 +277,7 @@ BACKENDS = {
 }
 
 
-def dispatch_to_claude_code(prompt: str, sender: str, msg_id: str) -> None:
+def dispatch_to_claude_code(prompt: str, sender: str, msg_id: str) -> bool:
     PROMPT_ROOT.mkdir(parents=True, exist_ok=True)
     prompt_path = PROMPT_ROOT / f"{safe_name(msg_id)}.md"
     prompt_path.write_text(prompt)
@@ -265,14 +285,14 @@ def dispatch_to_claude_code(prompt: str, sender: str, msg_id: str) -> None:
     backend = BACKENDS.get(TERMINAL)
     if backend is None:
         log.error("unknown CC_TERMINAL=%r (expected 'ghostty' or 'cmux')", TERMINAL)
-        return
+        return False
     open_session, send_pointer = backend
 
     try:
         handle = open_session()
     except Exception as e:
         log.error("open session failed (terminal=%s): %s", TERMINAL, e)
-        return
+        return False
 
     pointer = (
         f"An email task arrived at {INBOX} from {sender}. "
@@ -282,10 +302,11 @@ def dispatch_to_claude_code(prompt: str, sender: str, msg_id: str) -> None:
         send_pointer(handle, pointer)
     except Exception as e:
         log.error("send pointer failed (terminal=%s): %s", TERMINAL, e)
-        return
+        return False
     log.info(
         "dispatched via %s for %s (prompt_file=%s)", TERMINAL, sender, prompt_path
     )
+    return True
 
 
 def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
@@ -308,7 +329,33 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
     if saved:
         log.info("attachments saved=%d for %s", len(saved), sender)
     prompt = build_prompt(raw_from, subject, text, saved)
-    dispatch_to_claude_code(prompt, sender, msg.message_id)
+    ok = dispatch_to_claude_code(prompt, sender, msg.message_id)
+
+    if not ok:
+        # Dispatch failed (e.g. terminal unreachable). Leave the message UNREAD
+        # so the task is not silently lost, and bounce a reply back so the
+        # sender knows to resend or fix their terminal. A common cause on cmux:
+        # socketControlMode is "cmuxOnly", which blocks this launchd daemon
+        # (not a cmux child) -- see the README cmux setup section.
+        log.error(
+            "dispatch FAILED; leaving unread for retry sender=%s subj=%r msg=%s",
+            sender, subject, msg.message_id,
+        )
+        try:
+            client.inboxes.messages.reply(
+                inbox_id=INBOX,
+                message_id=msg.message_id,
+                text=(
+                    f"Could not dispatch '{subject}' to your terminal "
+                    f"(CC_TERMINAL={TERMINAL}). The task was left unread; resend "
+                    f"once the terminal is reachable. If you use cmux, confirm "
+                    f"automation.socketControlMode is not 'cmuxOnly' and that "
+                    f"cmux was restarted after changing it."
+                ),
+            )
+        except Exception as e:
+            log.warning("failure-reply skipped: %s", e)
+        return
 
     try:
         client.inboxes.messages.update(

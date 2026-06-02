@@ -30,7 +30,7 @@ Pick one with `CC_TERMINAL` in your env.
 5. The selected backend opens a new Claude Code session and sends a single-line pointer telling Claude to read and act on the prompt file:
    - **cmux:** `surface.create` (auto-launches Claude Code via the Ghostty config cmux reads) -> poll `surface.read_text` until ready -> `surface.send_text` the pointer -> `surface.send_key enter`. Every call targets a specific `surface_id`, so concurrent emails never collide.
    - **ghostty:** `osascript` activates Ghostty and opens a new tab (Ghostty auto-launches Claude Code in new tabs), then pastes the pointer via the clipboard and presses Return.
-6. The message is marked read via the AgentMail REST API.
+6. On a successful dispatch the message is marked read via the AgentMail REST API. If the dispatch fails (terminal unreachable), the message is left **unread** and a reply is bounced back to the sender so the task is never silently lost. `surface.create` is retried with backoff to ride out a briefly unresponsive cmux.
 
 The email is referenced by file path rather than typed inline, which keeps multi-line bodies intact across both backends. Image attachments are read by Claude with the Read tool from the paths in the prompt file.
 
@@ -89,7 +89,23 @@ cmux runs Ghostty surfaces and reads `~/.config/ghostty/config`, so point Ghostt
 command = /Users/YOUR_USERNAME/.local/bin/claude-launcher.sh
 ```
 
-Set `CC_TERMINAL=cmux` in `cc.env`. The daemon calls the cmux CLI by absolute path; if cmux isn't at the default location, set `CMUX_BIN`. Same-user local socket calls resolve the saved cmux Settings password automatically.
+Set `CC_TERMINAL=cmux` in `cc.env`. The daemon calls the cmux CLI by absolute path; if cmux isn't at the default location, set `CMUX_BIN`.
+
+**Required: open cmux's socket to the daemon.** cmux's RPC socket defaults to `automation.socketControlMode = "cmuxOnly"`, which only accepts connections from processes started *inside* cmux. This daemon runs under launchd and is **not** a cmux child, so with the default it is rejected on every dispatch (`Failed to write to socket (Broken pipe)` or `Access denied - only processes started inside cmux can connect`). The same `cmux rpc` call works from an interactive shell because that shell *is* a cmux child, which makes this easy to miss.
+
+Run the helper to set a mode that lets the daemon in:
+
+```bash
+# allowAll: any local process running as you can drive cmux (no password).
+# The socket is user-only, so marginal risk is low. Simplest.
+python3 setup_cmux.py --mode allowAll
+
+# password: the daemon must present CMUX_SOCKET_PASSWORD. Tighter.
+python3 setup_cmux.py --mode password --password "$(openssl rand -hex 20)"
+# then add the same value as CMUX_SOCKET_PASSWORD in cc.env
+```
+
+**You must fully restart cmux (Quit + reopen) afterward.** `socketControlMode` is read at app launch only; `cmux reload-config` does not apply it and there is no live RPC to set it. Verify with `cmux capabilities | grep access_mode` (it should no longer say `cmuxOnly`).
 
 ### Option B: standalone Ghostty
 
@@ -183,6 +199,7 @@ dispatch.
 ## Files
 
 - `cc-daemon.py` - the daemon (both backends)
+- `setup_cmux.py` - one-shot helper to open cmux's socket to the daemon (cmux backend)
 - `run-daemon.sh` - sources `cc.env` and execs the daemon
 - `test_cc_daemon.py` - unit tests
 - `com.agentmail.cc.plist.example` - launchd job template
