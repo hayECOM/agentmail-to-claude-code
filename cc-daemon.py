@@ -27,7 +27,9 @@ import logging
 import os
 import pathlib
 import re
+import shlex
 import subprocess
+import sys
 import tarfile
 import time
 import urllib.parse
@@ -121,6 +123,16 @@ PRIMITIVE_EMAIL_STATUSES = [
 PRIMITIVE_HTTP_USER_AGENT = os.environ.get(
     "PRIMITIVE_HTTP_USER_AGENT", "agentmail-to-claude-code/primitive"
 )
+
+# Completion-reply helper. The dispatched (interactive) Claude session has no
+# stdout for the daemon to capture and mail back, so the session closes the loop
+# itself: when it finishes the task it runs this script to reply on the original
+# thread. We bake the absolute path + the daemon's own interpreter (the venv
+# python, which has the agentmail SDK) into the instruction so it runs from the
+# session's working dir without setup. Override CC_REPLY_ENABLED=0 to drop the
+# instruction entirely (e.g. for a read-only mirror that should never reply).
+REPLY_SCRIPT = pathlib.Path(__file__).resolve().parent / "cc-reply.py"
+REPLY_ENABLED = os.environ.get("CC_REPLY_ENABLED", "1").strip() not in ("0", "false", "no")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -391,7 +403,21 @@ def _refetch_message_body(client: AgentMail, message_id: str) -> str:
     return ""
 
 
-def build_prompt(raw_from: str, subject: str, text: str, attachments: list[dict]) -> str:
+def _reply_command(message_id: str) -> str:
+    """Fully-formed shell command the session runs to reply on this thread."""
+    return (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(REPLY_SCRIPT))} "
+        f"--message-id {shlex.quote(message_id)}"
+    )
+
+
+def build_prompt(
+    raw_from: str,
+    subject: str,
+    text: str,
+    attachments: list[dict],
+    reply_command: str | None = None,
+) -> str:
     if attachments:
         attach_lines = "\n".join(
             f"- {d['path']} ({d['content_type'] or 'unknown'}, {format_size(d['size'])})"
@@ -403,6 +429,18 @@ def build_prompt(raw_from: str, subject: str, text: str, attachments: list[dict]
         )
     else:
         attach_block = ""
+    if reply_command:
+        reply_block = (
+            "\n---\n"
+            "When you have finished the task, send ONE short reply to the sender "
+            "on this email thread so they know the outcome. Run this exact "
+            "command, with your one-or-two-sentence summary as the body:\n\n"
+            f"    {reply_command} --body 'Done -- <summary of what you did>'\n\n"
+            "Reply only once, at the very end. If the task failed, reply with "
+            "what went wrong instead. Do not reply for intermediate progress.\n"
+        )
+    else:
+        reply_block = ""
     return (
         f"You received the following email at {INBOX} from an allowlisted "
         f"sender. Treat the subject + body as a task to execute.\n\n"
@@ -410,6 +448,7 @@ def build_prompt(raw_from: str, subject: str, text: str, attachments: list[dict]
         f"Subject: {subject}\n\n"
         f"{text}\n"
         f"{attach_block}"
+        f"{reply_block}"
     )
 
 
@@ -608,7 +647,8 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
     saved = download_attachments(client, msg)
     if saved:
         log.info("attachments saved=%d for %s", len(saved), sender)
-    prompt = build_prompt(raw_from, subject, text, saved)
+    reply_command = _reply_command(msg.message_id) if REPLY_ENABLED else None
+    prompt = build_prompt(raw_from, subject, text, saved, reply_command)
     ok = dispatch_to_claude_code(prompt, sender, msg.message_id)
 
     if not ok:
@@ -636,6 +676,23 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
         except Exception as e:
             log.warning("failure-reply skipped: %s", e)
         return
+
+    # Acknowledge receipt immediately. The dispatched session sends the real
+    # completion reply when it finishes (see the reply instruction in the
+    # prompt); this ack guarantees the sender gets a response even if that
+    # session never reports back, closing the "it went silent" gap.
+    if REPLY_ENABLED:
+        try:
+            client.inboxes.messages.reply(
+                inbox_id=INBOX,
+                message_id=msg.message_id,
+                text=(
+                    f"🛠️ Pua picked up '{subject}' and is working on it in a "
+                    f"terminal now. You'll get a reply here when it's done."
+                ),
+            )
+        except Exception as e:
+            log.warning("ack-reply skipped: %s", e)
 
     try:
         client.inboxes.messages.update(
@@ -690,10 +747,26 @@ def handle_primitive_email(detail: dict, state: dict) -> None:
     saved = primitive_download_attachments(detail)
     if saved:
         log.info("attachments saved=%d for %s", len(saved), sender)
-    prompt = build_prompt(raw_from, subject, text, saved)
+    reply_command = _reply_command(email_id) if REPLY_ENABLED else None
+    prompt = build_prompt(raw_from, subject, text, saved, reply_command)
     ok = dispatch_to_claude_code(prompt, sender, email_id)
 
     if ok:
+        if REPLY_ENABLED:
+            try:
+                primitive_request_json(
+                    "POST",
+                    f"/emails/{urllib.parse.quote(email_id, safe='')}/reply",
+                    payload={
+                        "body_text": (
+                            f"🛠️ Pua picked up '{subject}' and is working on it "
+                            f"in a terminal now. You'll get a reply here when "
+                            f"it's done."
+                        )
+                    },
+                )
+            except Exception as e:
+                log.warning("ack-reply skipped: %s", e)
         mark_processed(state, email_id)
         return
 

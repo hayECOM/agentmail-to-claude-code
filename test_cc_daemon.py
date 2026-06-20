@@ -155,6 +155,26 @@ def test_refetch_message_body_returns_empty_when_never_parsed(monkeypatch):
     assert daemon._refetch_message_body(_Client(), "<m@x>") == ""
 
 
+def test_build_prompt_omits_reply_block_without_command():
+    p = daemon.build_prompt("a@example.com", "subj", "body", [])
+    assert "finished the task" not in p
+
+
+def test_build_prompt_includes_reply_instruction_with_command():
+    cmd = daemon._reply_command("<m-1@x>")
+    p = daemon.build_prompt("a@example.com", "subj", "body", [], cmd)
+    assert "send ONE short reply" in p
+    assert cmd in p
+    assert "--body" in p
+
+
+def test_reply_command_quotes_message_id_and_points_at_helper():
+    cmd = daemon._reply_command("<m-1@x>")
+    assert str(daemon.REPLY_SCRIPT) in cmd
+    assert "--message-id" in cmd
+    assert "'<m-1@x>'" in cmd  # shell-quoted so angle brackets are literal
+
+
 # --- Primitive helpers -------------------------------------------------------
 
 
@@ -408,11 +428,34 @@ def _prep_handle(monkeypatch, tmp_path, ok):
     monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: ok)
 
 
-def test_handle_marks_read_only_on_success(monkeypatch, tmp_path):
+def test_handle_marks_read_and_acks_on_success(monkeypatch, tmp_path):
     _prep_handle(monkeypatch, tmp_path, ok=True)
+    monkeypatch.setattr(daemon, "REPLY_ENABLED", True)
+    client = _FakeClient()
+    daemon.handle_message(client, _Ev())
+    # success: marked read AND a single received-ack sent back to the sender.
+    assert client.inboxes.messages.updated
+    assert len(client.inboxes.messages.replied) == 1
+    assert "working on it" in client.inboxes.messages.replied[0]["text"]
+
+
+def test_handle_skips_ack_when_replies_disabled(monkeypatch, tmp_path):
+    _prep_handle(monkeypatch, tmp_path, ok=True)
+    monkeypatch.setattr(daemon, "REPLY_ENABLED", False)
     client = _FakeClient()
     daemon.handle_message(client, _Ev())
     assert client.inboxes.messages.updated and not client.inboxes.messages.replied
+
+
+def test_handle_prompt_carries_reply_instruction(monkeypatch, tmp_path):
+    _prep_handle(monkeypatch, tmp_path, ok=True)
+    monkeypatch.setattr(daemon, "REPLY_ENABLED", True)
+    captured = {}
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code",
+                        lambda prompt, sender, mid: captured.update(prompt=prompt) or True)
+    daemon.handle_message(_FakeClient(), _Ev())
+    assert "send ONE short reply" in captured["prompt"]
+    assert "--message-id" in captured["prompt"]
 
 
 def test_handle_leaves_unread_and_replies_on_failure(monkeypatch, tmp_path):
@@ -512,13 +555,18 @@ def test_handle_dispatches_with_secret_in_subject(monkeypatch, tmp_path):
     assert dispatched
 
 
-def test_handle_primitive_email_success_marks_processed(monkeypatch):
+def test_handle_primitive_email_success_marks_processed_and_acks(monkeypatch):
     state = {"processed": []}
+    acks = []
     monkeypatch.setattr(daemon, "ALLOWED_FROM", {"a@example.com"})
+    monkeypatch.setattr(daemon, "REPLY_ENABLED", True)
     monkeypatch.setattr(daemon, "primitive_download_attachments", lambda _detail: [])
     monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: True)
+    monkeypatch.setattr(daemon, "primitive_request_json",
+                        lambda method, path, **kw: acks.append((method, path, kw)) or {})
     daemon.handle_primitive_email(_primitive_detail(), state)
     assert state["processed"] == ["em_primitive"]
+    assert len(acks) == 1 and acks[0][0] == "POST" and acks[0][1].endswith("/reply")
 
 
 def test_handle_primitive_email_failure_replies_once_and_marks_processed(monkeypatch):
