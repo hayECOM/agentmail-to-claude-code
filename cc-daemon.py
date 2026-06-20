@@ -417,6 +417,7 @@ def build_prompt(
     text: str,
     attachments: list[dict],
     reply_command: str | None = None,
+    thread_id: str | None = None,
 ) -> str:
     if attachments:
         attach_lines = "\n".join(
@@ -449,9 +450,27 @@ def build_prompt(
         )
     else:
         reply_block = ""
+    # Thread context: the dispatched session is stateless and only sees this one
+    # message. If this is a reply, prior turns survive only as (lossy) email-client
+    # quoting in the body. Point the agent at the authoritative thread instead, to
+    # be fetched on demand -- a first-contact email is a single-message thread, so
+    # the agent simply proceeds; a reply pulls full history via the AgentMail MCP.
+    if thread_id:
+        thread_block = (
+            f"This message is part of AgentMail thread {thread_id} in inbox "
+            f"{INBOX}. If it is a reply or part of an ongoing conversation, first "
+            f"call the AgentMail MCP get_thread tool with inboxId=\"{INBOX}\" and "
+            f"threadId=\"{thread_id}\" to load the full thread history for context "
+            f"before acting. The message below is the latest in the thread and "
+            f"contains the actual task. If get_thread is unavailable or errors, "
+            f"fall back to any quoted text in the body.\n\n"
+        )
+    else:
+        thread_block = ""
     return (
         f"You received the following email at {INBOX} from an allowlisted "
         f"sender. Treat the subject + body as a task to execute.\n\n"
+        f"{thread_block}"
         f"From: {raw_from}\n"
         f"Subject: {subject}\n\n"
         f"{text}\n"
@@ -656,7 +675,9 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
     if saved:
         log.info("attachments saved=%d for %s", len(saved), sender)
     reply_command = _reply_command(msg.message_id) if REPLY_ENABLED else None
-    prompt = build_prompt(raw_from, subject, text, saved, reply_command)
+    prompt = build_prompt(
+        raw_from, subject, text, saved, reply_command, thread_id=msg.thread_id
+    )
     ok = dispatch_to_claude_code(prompt, sender, msg.message_id)
 
     if not ok:

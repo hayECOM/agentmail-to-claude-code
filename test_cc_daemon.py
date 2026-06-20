@@ -178,6 +178,40 @@ def test_reply_command_quotes_message_id_and_points_at_helper():
     assert "'<m-1@x>'" in cmd  # shell-quoted so angle brackets are literal
 
 
+def test_build_prompt_includes_thread_block_when_thread_id_given():
+    p = daemon.build_prompt("a@example.com", "subj", "body", [], thread_id="thr_123")
+    assert "thr_123" in p
+    assert "get_thread" in p
+    # Inbox is named so the agent can call get_thread with both required args.
+    assert daemon.INBOX in p
+
+
+def test_build_prompt_thread_instruction_is_conditional():
+    # The fetch must be phrased as "only if part of an ongoing thread" so a
+    # first-contact email is a no-op. Guards against a future edit making it
+    # unconditional.
+    p = daemon.build_prompt("a@example.com", "subj", "body", [], thread_id="thr_9")
+    assert "reply or part of an ongoing conversation" in p
+
+
+def test_build_prompt_omits_thread_block_without_thread_id():
+    default = daemon.build_prompt("a@example.com", "subj", "body", [])
+    explicit_none = daemon.build_prompt(
+        "a@example.com", "subj", "body", [], thread_id=None
+    )
+    assert default == explicit_none
+    assert "get_thread" not in default
+    assert "thread" not in default
+
+
+def test_build_prompt_thread_block_coexists_with_attachments():
+    atts = [{"path": "/tmp/a.png", "content_type": "image/png", "size": 1234}]
+    p = daemon.build_prompt("a@example.com", "subj", "body", atts, thread_id="thr_9")
+    assert "get_thread" in p
+    assert "/tmp/a.png" in p
+    assert "use the Read tool" in p
+
+
 # --- Primitive helpers -------------------------------------------------------
 
 
@@ -417,6 +451,7 @@ class _Msg:
         self.labels = ["received", "unread"]
         self.attachments = []
         self.from_ = "Allowed <a@example.com>"
+        self.thread_id = "thr-h"
 
 
 class _Ev:
