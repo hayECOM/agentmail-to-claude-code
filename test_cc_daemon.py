@@ -95,6 +95,13 @@ def test_message_body_prefers_text_then_extracted():
 
     assert daemon._message_body(M2()) == "from html"
 
+    # whitespace-only text/plain must fall through to extracted_text, not mask it
+    class M2b:
+        text = "  \n\t "
+        extracted_text = "from html"
+
+    assert daemon._message_body(M2b()) == "from html"
+
     class M3:
         text = None
         extracted_text = None

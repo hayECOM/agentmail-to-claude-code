@@ -354,13 +354,16 @@ def _message_body(msg) -> str:
     """Body text from a message, tolerating an empty text/plain part.
 
     Gmail sends inline-screenshot mail HTML-first, so the text/plain part can be
-    empty and msg.text == "". extracted_text is AgentMail's own plain-text
-    rendering of the message and is the reliable fallback.
+    empty -- or whitespace-only -- and msg.text falsy after stripping.
+    extracted_text is AgentMail's own plain-text rendering of the message and is
+    the reliable fallback. Strip each candidate before choosing so a
+    whitespace-only text part falls through instead of masking extracted_text.
     """
-    return (
-        (getattr(msg, "text", None) or "")
-        or (getattr(msg, "extracted_text", None) or "")
-    ).strip()
+    for attr in ("text", "extracted_text"):
+        value = (getattr(msg, attr, None) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _refetch_message_body(client: AgentMail, message_id: str) -> str:
