@@ -349,6 +349,48 @@ def _primitive_detail():
     }
 
 
+def test_handle_drops_unauthenticated_when_no_secret(monkeypatch, tmp_path):
+    # No trigger secret configured -> fall back to the is_authenticated label
+    # gate, NOT allow every allowlisted (spoofable) sender through.
+    _prep_handle(monkeypatch, tmp_path, ok=True)
+    monkeypatch.setattr(daemon, "TRIGGER_SECRET", "")
+    dispatched = []
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code",
+                        lambda *a: dispatched.append(a) or True)
+    client = _FakeClient()
+    ev = _Ev()
+    ev.message.labels = ["received", "unauthenticated"]
+    daemon.handle_message(client, ev)
+    assert not dispatched
+    assert not client.inboxes.messages.updated
+
+
+def test_handle_requires_secret_in_subject_when_set(monkeypatch, tmp_path):
+    _prep_handle(monkeypatch, tmp_path, ok=True)
+    monkeypatch.setattr(daemon, "TRIGGER_SECRET", "sesame")
+    dispatched = []
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code",
+                        lambda *a: dispatched.append(a) or True)
+    client = _FakeClient()
+    ev = _Ev()
+    ev.message.subject = "no secret here"
+    daemon.handle_message(client, ev)
+    assert not dispatched
+
+
+def test_handle_dispatches_with_secret_in_subject(monkeypatch, tmp_path):
+    _prep_handle(monkeypatch, tmp_path, ok=True)
+    monkeypatch.setattr(daemon, "TRIGGER_SECRET", "sesame")
+    dispatched = []
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code",
+                        lambda *a: dispatched.append(a) or True)
+    client = _FakeClient()
+    ev = _Ev()
+    ev.message.subject = "please run sesame now"
+    daemon.handle_message(client, ev)
+    assert dispatched
+
+
 def test_handle_primitive_email_success_marks_processed(monkeypatch):
     state = {"processed": []}
     monkeypatch.setattr(daemon, "ALLOWED_FROM", {"a@example.com"})

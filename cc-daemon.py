@@ -58,6 +58,12 @@ ALLOWED_FROM = {
     if addr.strip()
 }
 
+# Path A gate (this install): inbound ronyhay.com mail arrives "unauthenticated"
+# via AgentMail (DKIM/DMARC doesn't align through the Gmail relay), so the daemon
+# requires this secret in the subject instead of the DKIM/SPF label. Empty string
+# disables the secret check and restores the upstream is_authenticated() behavior.
+TRIGGER_SECRET = os.environ.get("CC_TRIGGER_SECRET", "").strip()
+
 CC_HOME = pathlib.Path(
     os.environ.get("CC_HOME", pathlib.Path.home() / ".agentmail-cc")
 )
@@ -517,7 +523,14 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
     if sender not in ALLOWED_FROM:
         log.info("DROP sender-not-allowed sender=%s", sender)
         return
-    if not is_authenticated(labels):
+    if TRIGGER_SECRET:
+        if TRIGGER_SECRET not in subject:
+            log.info("DROP missing-trigger-secret sender=%s subj=%r", sender, subject)
+            return
+    elif not is_authenticated(labels):
+        # No secret configured -> fall back to the DKIM/SPF auth label so the
+        # default gate still drops spoofed/unauthenticated mail (matches the
+        # CC_TRIGGER_SECRET comment above; the sender allowlist alone is spoofable).
         log.info("DROP not-authenticated sender=%s labels=%s", sender, labels)
         return
 
