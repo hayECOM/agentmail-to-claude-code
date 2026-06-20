@@ -80,7 +80,13 @@ CMUX_BIN = os.environ.get(
 )
 # Substring printed in a fresh Claude Code surface once it is ready for input.
 CLAUDE_READY_MARKER = "bypass permissions on"
-CLAUDE_READY_TIMEOUT_S = int(os.environ.get("CC_READY_TIMEOUT", "25"))
+# How long to wait for Claude's TUI to finish booting in a fresh surface. This
+# env (MCP servers + plugins) cold-starts Claude well past 25s, so wait longer.
+CLAUDE_READY_TIMEOUT_S = int(os.environ.get("CC_READY_TIMEOUT", "120"))
+# How often to re-check the surface for the ready marker. Keep this small so we
+# send within a couple seconds of Claude becoming ready, not at the next coarse
+# tick -- the interval is "how often we peek," not "how long we wait."
+CLAUDE_READY_POLL_S = int(os.environ.get("CC_READY_POLL", "3"))
 # surface.create can fail with a transient "Broken pipe" when cmux's control
 # plane is briefly unresponsive (mid-restart, recovering from a crash). Retry a
 # few times with backoff before giving up so a flaky cmux self-heals.
@@ -451,13 +457,16 @@ def _cmux_open_session() -> str:
                 return surface_id
         except subprocess.CalledProcessError:
             pass  # transient read failure; retry until deadline
-        time.sleep(1)
-    log.warning(
-        "claude ready marker not seen in surface=%s within %ds; sending anyway",
-        surface_id,
-        CLAUDE_READY_TIMEOUT_S,
+        time.sleep(CLAUDE_READY_POLL_S)
+    # Claude never reported ready. Do NOT send into a half-booted surface: the
+    # pointer would land in a shell (or a Claude not yet accepting input) and be
+    # lost, while the email got marked read -- silent data loss. Fail instead so
+    # dispatch_to_claude_code returns False, the message stays unread, and the
+    # sender gets a bounce telling them to resend.
+    raise RuntimeError(
+        f"claude ready marker not seen in surface={surface_id} within "
+        f"{CLAUDE_READY_TIMEOUT_S}s; not sending"
     )
-    return surface_id
 
 
 def _cmux_send_pointer(surface_id: str, pointer_line: str) -> None:

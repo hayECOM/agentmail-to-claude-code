@@ -92,6 +92,12 @@ The daemon needs your terminal to start Claude Code automatically when a new ses
 ```bash
 # ~/.local/bin/claude-launcher.sh
 #!/bin/zsh
+# cmux/Ghostty spawn surfaces with a minimal GUI PATH that omits the dir where
+# the `claude` binary lives (e.g. /opt/homebrew/bin), and this non-interactive
+# shell never sources ~/.zshrc, so a `claude` shell-function alias isn't defined
+# either. Without this line `claude` is "command not found", Claude never starts,
+# and the daemon's readiness wait times out. Prepend the bins so it resolves.
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 caffeinate -dimsu -- claude --dangerously-skip-permissions
 echo "Claude exited. Type 'claude' to relaunch or 'exit' to close."
 exec /bin/zsh -li

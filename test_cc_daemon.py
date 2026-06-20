@@ -186,6 +186,18 @@ def test_cmux_open_session_raises_without_id(monkeypatch):
         daemon._cmux_open_session()
 
 
+def test_cmux_open_session_raises_when_marker_never_appears(monkeypatch):
+    # Surface is created but Claude never reports ready: must raise (so dispatch
+    # fails -> message left unread + bounce) rather than send into a dead shell.
+    monkeypatch.setattr(daemon, "_cmux_rpc", lambda m, p=None: {"surface_id": "SID"})
+    monkeypatch.setattr(daemon, "_surface_text", lambda s: "still booting...")
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)
+    clock = iter([0.0, 1.0, daemon.CLAUDE_READY_TIMEOUT_S + 1])
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: next(clock))
+    with pytest.raises(RuntimeError):
+        daemon._cmux_open_session()
+
+
 def test_cmux_send_pointer_text_then_enter(monkeypatch):
     calls = []
     monkeypatch.setattr(daemon, "_cmux_rpc", lambda m, p=None: calls.append((m, p)))
