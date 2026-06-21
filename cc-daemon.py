@@ -430,14 +430,22 @@ def build_prompt(
     else:
         attach_block = ""
     if reply_command:
+        # Body goes in on stdin via a single-quoted heredoc, NOT a --body shell
+        # arg: a summary like "Done -- couldn't reproduce" would break a quoted
+        # argument, and that apostrophe-bearing failure case is exactly when the
+        # reply matters most. A <<'SUMMARY' heredoc is literal, so apostrophes
+        # and quotes in the prose are safe. Keep the terminator at column 0.
         reply_block = (
             "\n---\n"
             "When you have finished the task, send ONE short reply to the sender "
-            "on this email thread so they know the outcome. Run this exact "
-            "command, with your one-or-two-sentence summary as the body:\n\n"
-            f"    {reply_command} --body 'Done -- <summary of what you did>'\n\n"
-            "Reply only once, at the very end. If the task failed, reply with "
-            "what went wrong instead. Do not reply for intermediate progress.\n"
+            "on this email thread so they know the outcome. Pipe your "
+            "one-or-two-sentence summary into this command on stdin, exactly like "
+            "this (the quoted heredoc keeps apostrophes and quotes safe):\n\n"
+            f"{reply_command} <<'SUMMARY'\n"
+            "Done -- <your summary here; apostrophes and quotes are fine>\n"
+            "SUMMARY\n\n"
+            "Reply only once, at the very end. If the task failed, say what went "
+            "wrong instead. Do not reply for intermediate progress.\n"
         )
     else:
         reply_block = ""
@@ -661,20 +669,23 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
             "dispatch FAILED; leaving unread for retry sender=%s subj=%r msg=%s",
             sender, subject, msg.message_id,
         )
-        try:
-            client.inboxes.messages.reply(
-                inbox_id=INBOX,
-                message_id=msg.message_id,
-                text=(
-                    f"Could not dispatch '{subject}' to your terminal "
-                    f"(CC_TERMINAL={TERMINAL}). The task was left unread; resend "
-                    f"once the terminal is reachable. If you use cmux, confirm "
-                    f"automation.socketControlMode is not 'cmuxOnly' and that "
-                    f"cmux was restarted after changing it."
-                ),
-            )
-        except Exception as e:
-            log.warning("failure-reply skipped: %s", e)
+        # Gate the bounce on REPLY_ENABLED too: with replies disabled the daemon
+        # must emit no outbound mail at all, not just skip the ack/completion.
+        if REPLY_ENABLED:
+            try:
+                client.inboxes.messages.reply(
+                    inbox_id=INBOX,
+                    message_id=msg.message_id,
+                    text=(
+                        f"Could not dispatch '{subject}' to your terminal "
+                        f"(CC_TERMINAL={TERMINAL}). The task was left unread; resend "
+                        f"once the terminal is reachable. If you use cmux, confirm "
+                        f"automation.socketControlMode is not 'cmuxOnly' and that "
+                        f"cmux was restarted after changing it."
+                    ),
+                )
+            except Exception as e:
+                log.warning("failure-reply skipped: %s", e)
         return
 
     # Acknowledge receipt immediately. The dispatched session sends the real
@@ -774,7 +785,8 @@ def handle_primitive_email(detail: dict, state: dict) -> None:
         "dispatch FAILED; marking processed after failure reply sender=%s subj=%r msg=%s",
         sender, subject, email_id,
     )
-    primitive_reply_failure(detail, subject)
+    if REPLY_ENABLED:
+        primitive_reply_failure(detail, subject)
     mark_processed(state, email_id)
 
 

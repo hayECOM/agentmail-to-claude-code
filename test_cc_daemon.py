@@ -165,7 +165,10 @@ def test_build_prompt_includes_reply_instruction_with_command():
     p = daemon.build_prompt("a@example.com", "subj", "body", [], cmd)
     assert "send ONE short reply" in p
     assert cmd in p
-    assert "--body" in p
+    # body is fed via a single-quoted heredoc (apostrophe-safe), not a --body arg
+    assert "<<'SUMMARY'" in p
+    assert "\nSUMMARY\n" in p
+    assert "--body" not in p
 
 
 def test_reply_command_quotes_message_id_and_points_at_helper():
@@ -460,11 +463,22 @@ def test_handle_prompt_carries_reply_instruction(monkeypatch, tmp_path):
 
 def test_handle_leaves_unread_and_replies_on_failure(monkeypatch, tmp_path):
     _prep_handle(monkeypatch, tmp_path, ok=False)
+    monkeypatch.setattr(daemon, "REPLY_ENABLED", True)
     client = _FakeClient()
     daemon.handle_message(client, _Ev())
     # not marked read; a failure reply was bounced back instead.
     assert not client.inboxes.messages.updated
     assert client.inboxes.messages.replied
+
+
+def test_handle_failure_emits_no_mail_when_replies_disabled(monkeypatch, tmp_path):
+    # CC_REPLY_ENABLED=0 must suppress the failure bounce too, not just the ack.
+    _prep_handle(monkeypatch, tmp_path, ok=False)
+    monkeypatch.setattr(daemon, "REPLY_ENABLED", False)
+    client = _FakeClient()
+    daemon.handle_message(client, _Ev())
+    assert not client.inboxes.messages.updated
+    assert not client.inboxes.messages.replied
 
 
 def _primitive_detail():
@@ -573,9 +587,23 @@ def test_handle_primitive_email_failure_replies_once_and_marks_processed(monkeyp
     state = {"processed": []}
     replies = []
     monkeypatch.setattr(daemon, "ALLOWED_FROM", {"a@example.com"})
+    monkeypatch.setattr(daemon, "REPLY_ENABLED", True)
     monkeypatch.setattr(daemon, "primitive_download_attachments", lambda _detail: [])
     monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: False)
     monkeypatch.setattr(daemon, "primitive_reply_failure", lambda detail, subject: replies.append((detail["id"], subject)))
     daemon.handle_primitive_email(_primitive_detail(), state)
     assert replies == [("em_primitive", "do a primitive thing")]
     assert state["processed"] == ["em_primitive"]
+
+
+def test_handle_primitive_failure_no_reply_when_disabled(monkeypatch):
+    state = {"processed": []}
+    replies = []
+    monkeypatch.setattr(daemon, "ALLOWED_FROM", {"a@example.com"})
+    monkeypatch.setattr(daemon, "REPLY_ENABLED", False)
+    monkeypatch.setattr(daemon, "primitive_download_attachments", lambda _detail: [])
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: False)
+    monkeypatch.setattr(daemon, "primitive_reply_failure", lambda detail, subject: replies.append(detail["id"]))
+    daemon.handle_primitive_email(_primitive_detail(), state)
+    assert replies == []  # no outbound mail when replies disabled
+    assert state["processed"] == ["em_primitive"]  # still marked handled
