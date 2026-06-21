@@ -93,6 +93,15 @@ CLAUDE_READY_POLL_S = int(os.environ.get("CC_READY_POLL", "3"))
 SURFACE_CREATE_ATTEMPTS = int(os.environ.get("CC_SURFACE_CREATE_ATTEMPTS", "4"))
 SURFACE_CREATE_BACKOFF_S = int(os.environ.get("CC_SURFACE_CREATE_BACKOFF", "3"))
 
+# The AgentMail "received" websocket event can fire before the inbound message's
+# body has finished parsing -- notably for multipart mail carrying an inline
+# image/attachment, where msg.text/extracted_text arrive empty in the event even
+# though the body is readable over REST moments later. When an attachment email
+# shows an empty body we re-fetch by id, retrying briefly to clear the parse
+# race, so the screenshot's accompanying instructions are never silently lost.
+BODY_REFETCH_ATTEMPTS = int(os.environ.get("CC_BODY_REFETCH_ATTEMPTS", "3"))
+BODY_REFETCH_BACKOFF_S = int(os.environ.get("CC_BODY_REFETCH_BACKOFF", "2"))
+
 # Primitive backend: Primitive does not require provisioning individual inboxes.
 # Any local part at your Primitive domain can receive mail, so this daemon polls
 # the configured address and keeps local processed state.
@@ -341,6 +350,47 @@ def download_attachments(client: AgentMail, msg) -> list[dict]:
     return saved
 
 
+def _message_body(msg) -> str:
+    """Body text from a message, tolerating an empty text/plain part.
+
+    Gmail sends inline-screenshot mail HTML-first, so the text/plain part can be
+    empty -- or whitespace-only -- and msg.text falsy after stripping.
+    extracted_text is AgentMail's own plain-text rendering of the message and is
+    the reliable fallback. Strip each candidate before choosing so a
+    whitespace-only text part falls through instead of masking extracted_text.
+    """
+    for attr in ("text", "extracted_text"):
+        value = (getattr(msg, attr, None) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _refetch_message_body(client: AgentMail, message_id: str) -> str:
+    """Re-fetch a message over REST to recover a body the event omitted.
+
+    Retries briefly: the websocket "received" event for multipart mail can fire
+    before body parsing is written back, so an immediate fetch may still be
+    mid-parse. Returns "" if no body materializes within the retry budget.
+    """
+    for attempt in range(1, BODY_REFETCH_ATTEMPTS + 1):
+        try:
+            full = client.inboxes.messages.get(inbox_id=INBOX, message_id=message_id)
+            body = _message_body(full)
+            if body:
+                if attempt > 1:
+                    log.info("body recovered on re-fetch attempt %d", attempt)
+                return body
+        except Exception as e:
+            log.warning(
+                "body re-fetch failed (attempt %d/%d): %s",
+                attempt, BODY_REFETCH_ATTEMPTS, e,
+            )
+        if attempt < BODY_REFETCH_ATTEMPTS:
+            time.sleep(BODY_REFETCH_BACKOFF_S)
+    return ""
+
+
 def build_prompt(raw_from: str, subject: str, text: str, attachments: list[dict]) -> str:
     if attachments:
         attach_lines = "\n".join(
@@ -525,7 +575,7 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
     raw_from = getattr(msg, "from_", None) or getattr(msg, "from", "")
     sender = parse_from(raw_from)
     subject = (msg.subject or "(no subject)").strip()
-    text = (msg.text or "").strip()
+    text = _message_body(msg)
     labels = list(msg.labels or [])
     log.info("recv from=%s subj=%r labels=%s", sender, subject, labels)
 
@@ -542,6 +592,18 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
         # CC_TRIGGER_SECRET comment above; the sender allowlist alone is spoofable).
         log.info("DROP not-authenticated sender=%s labels=%s", sender, labels)
         return
+
+    # An attachment email whose event body is empty hit the multipart parse race
+    # (the body rode along in the HTML part and the "received" event fired before
+    # parsing finished). Recover it over REST so the screenshot's instructions
+    # are not dropped. Genuinely empty subject-only mail (no attachment) is left
+    # as-is -- re-fetching it would just burn the retry budget for no body.
+    if not text and getattr(msg, "attachments", None):
+        recovered = _refetch_message_body(client, msg.message_id)
+        if recovered:
+            text = recovered
+        else:
+            log.warning("empty body after re-fetch sender=%s subj=%r", sender, subject)
 
     saved = download_attachments(client, msg)
     if saved:

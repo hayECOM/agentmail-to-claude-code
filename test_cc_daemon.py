@@ -79,6 +79,82 @@ def test_build_prompt_lists_attachment_paths():
     assert "use the Read tool" in p
 
 
+# --- body extraction / re-fetch ---------------------------------------------
+
+
+def test_message_body_prefers_text_then_extracted():
+    class M:
+        text = "plain body"
+        extracted_text = "ignored"
+
+    assert daemon._message_body(M()) == "plain body"
+
+    class M2:
+        text = ""
+        extracted_text = "from html"
+
+    assert daemon._message_body(M2()) == "from html"
+
+    # whitespace-only text/plain must fall through to extracted_text, not mask it
+    class M2b:
+        text = "  \n\t "
+        extracted_text = "from html"
+
+    assert daemon._message_body(M2b()) == "from html"
+
+    class M3:
+        text = None
+        extracted_text = None
+
+    assert daemon._message_body(M3()) == ""
+
+
+def test_refetch_message_body_recovers_after_parse_race(monkeypatch):
+    # First REST fetch is still mid-parse (empty body); the second has it.
+    class _FullEmpty:
+        text = ""
+        extracted_text = ""
+
+    class _FullReady:
+        text = "recovered body"
+        extracted_text = ""
+
+    seq = iter([_FullEmpty(), _FullReady()])
+
+    class _Messages:
+        def get(self, **kw):
+            return next(seq)
+
+    class _Inboxes:
+        messages = _Messages()
+
+    class _Client:
+        inboxes = _Inboxes()
+
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(daemon, "BODY_REFETCH_ATTEMPTS", 3)
+    assert daemon._refetch_message_body(_Client(), "<m@x>") == "recovered body"
+
+
+def test_refetch_message_body_returns_empty_when_never_parsed(monkeypatch):
+    class _Messages:
+        def get(self, **kw):
+            class _F:
+                text = ""
+                extracted_text = ""
+            return _F()
+
+    class _Inboxes:
+        messages = _Messages()
+
+    class _Client:
+        inboxes = _Inboxes()
+
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(daemon, "BODY_REFETCH_ATTEMPTS", 2)
+    assert daemon._refetch_message_body(_Client(), "<m@x>") == ""
+
+
 # --- Primitive helpers -------------------------------------------------------
 
 
@@ -359,6 +435,39 @@ def _primitive_detail():
         "analysis": {"sender": {"authenticated": True}},
         "parsed": {"attachments": []},
     }
+
+
+def test_handle_refetches_body_when_event_body_empty_with_attachment(monkeypatch, tmp_path):
+    # The screenshot-bug case: event delivers an empty body but the mail carries
+    # an attachment, so the body is recovered over REST and reaches the prompt.
+    _prep_handle(monkeypatch, tmp_path, ok=True)
+    captured = {}
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code",
+                        lambda prompt, sender, mid: captured.update(prompt=prompt) or True)
+    monkeypatch.setattr(daemon, "_refetch_message_body", lambda client, mid: "body from rest")
+    client = _FakeClient()
+    ev = _Ev()
+    ev.message.text = ""
+    ev.message.extracted_text = ""
+    ev.message.attachments = [object()]
+    daemon.handle_message(client, ev)
+    assert "body from rest" in captured["prompt"]
+
+
+def test_handle_does_not_refetch_when_no_attachment(monkeypatch, tmp_path):
+    # Genuinely empty subject-only mail must not burn the re-fetch retry budget.
+    _prep_handle(monkeypatch, tmp_path, ok=True)
+    refetched = []
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: True)
+    monkeypatch.setattr(daemon, "_refetch_message_body",
+                        lambda client, mid: refetched.append(mid) or "")
+    client = _FakeClient()
+    ev = _Ev()
+    ev.message.text = ""
+    ev.message.extracted_text = ""
+    ev.message.attachments = []
+    daemon.handle_message(client, ev)
+    assert refetched == []
 
 
 def test_handle_drops_unauthenticated_when_no_secret(monkeypatch, tmp_path):
