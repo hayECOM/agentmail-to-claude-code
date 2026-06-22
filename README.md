@@ -37,6 +37,23 @@ Pick one with `CC_TERMINAL` in your env.
 
 The email is referenced by file path rather than typed inline, which keeps multi-line bodies intact across both backends. Image attachments are read by Claude with the Read tool from the paths in the prompt file.
 
+### Thread context
+
+Each email spawns a fresh, stateless Claude Code session that sees only that one
+message — so on a reply, prior turns would otherwise survive only as whatever the
+sender's email client quoted into the body. Instead, the AgentMail prompt names
+the message's `thread_id` and tells the agent to fetch the full thread **on
+demand**: if the message is a reply or part of an ongoing conversation, the agent
+calls the AgentMail MCP `get_thread` tool (`inboxId` + `threadId`) to reconstruct
+the authoritative history from the API before acting. A first-contact email is a
+single-message thread, so the agent just proceeds — no wasted fetch.
+
+This requires the AgentMail MCP to be connected (and its organization selected)
+in the Claude Code session; it's loaded from your global Claude config. If the MCP
+is unavailable or `get_thread` errors, the agent falls back to any quoted text in
+the body, so the feature is strictly additive — worst case is the prior behavior.
+The Primitive backend passes no `thread_id` and renders no thread block.
+
 ## Requirements
 
 - macOS (AppleScript, launchd)
