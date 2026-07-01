@@ -719,7 +719,7 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
                 inbox_id=INBOX,
                 message_id=msg.message_id,
                 text=(
-                    f"🛠️ Pua picked up '{subject}' and is working on it in a "
+                    f"🛠️ Roland picked up '{subject}' and is working on it in a "
                     f"terminal now. You'll get a reply here when it's done."
                 ),
             )
@@ -791,7 +791,7 @@ def handle_primitive_email(detail: dict, state: dict) -> None:
                     f"/emails/{urllib.parse.quote(email_id, safe='')}/reply",
                     payload={
                         "body_text": (
-                            f"🛠️ Pua picked up '{subject}' and is working on it "
+                            f"🛠️ Roland picked up '{subject}' and is working on it "
                             f"in a terminal now. You'll get a reply here when "
                             f"it's done."
                         )
