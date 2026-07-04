@@ -765,9 +765,14 @@ def handle_payment_lane(client: AgentMail, ev) -> None:
 
     decision = payment_lane.evaluate(recipients, headers, subject, labels, event_type)
     if not decision.qualified:
+        # A payment-SHAPED near-miss (a real payment that tripped one gate layer,
+        # e.g. DKIM showing mercury.com on auto-forwarded mail) would otherwise die
+        # silently here. Ping the 'cortana' topic so it surfaces for tuning; genuine
+        # spam (neither recipient nor subject matches) stays silent.
+        pinged = payment_lane.ping_near_miss(decision, subject)
         log.info(
-            "LANE2 IGNORE non-qualifying inbox=%s from=%s subj=%r reasons=%s",
-            LANE2_INBOX, sender, subject, "; ".join(decision.reasons),
+            "LANE2 IGNORE non-qualifying inbox=%s from=%s subj=%r near_miss_ping=%s reasons=%s",
+            LANE2_INBOX, sender, subject, pinged, "; ".join(decision.reasons),
         )
         return
 

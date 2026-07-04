@@ -155,6 +155,82 @@ def test_build_prompt_has_playbook_caseref_and_tg_guidance():
     assert "You are Cortana" in p
 
 
+# --- near-miss ping ----------------------------------------------------------
+
+def _fake_tg_send(prefix):
+    """A fake tg-send that logs each argv on its own line and exits 0.
+
+    Returns (path, argv_log). Injected via monkeypatch on pl.TG_SEND, mirroring the
+    fake-spawn-coder.sh style below.
+    """
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix=prefix))
+    argv_log = tmp / "tg-argv.log"
+    fake = tmp / "fake-tg-send.sh"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$@" >> "{argv_log}"\n'
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return fake, argv_log
+
+
+def test_is_payment_shaped_recipient_or_subject():
+    # subject-only match (bad recipient) is still payment-shaped
+    d = pl.evaluate(["nope@example.com"], _GOOD_AR, "Acme sent you $10", [], "message.received")
+    assert d.qualified is False and pl.is_payment_shaped(d) is True
+    # recipient-only match (bad subject) is still payment-shaped
+    d = pl.evaluate(["finance+po7@staygoldenhi.com"], _GOOD_AR, "hello", [], "message.received")
+    assert d.qualified is False and pl.is_payment_shaped(d) is True
+    # neither -> not payment-shaped
+    d = pl.evaluate(["nope@example.com"], {}, "win a prize", [], "message.received")
+    assert pl.is_payment_shaped(d) is False
+
+
+def test_ping_on_near_miss_dkim_fail(monkeypatch):
+    fake, argv_log = _fake_tg_send("pl-ping-")
+    monkeypatch.setattr(pl, "TG_SEND", str(fake))
+
+    # Auto-forwarded Mercury mail: recipient + subject match, but DKIM shows
+    # mercury.com (the first-sample tuning risk) instead of staygoldenhi.com.
+    bad = {"Authentication-Results": "mx; dkim=pass header.i=@mercury.com"}
+    d = pl.evaluate(["finance+po7@staygoldenhi.com"], bad,
+                    "Acme sent you $4,200.00", [], "message.received")
+    assert d.qualified is False
+
+    assert pl.ping_near_miss(d, "Acme sent you $4,200.00") is True
+    argv = argv_log.read_text()
+    assert "--topic" in argv and "cortana" in argv   # cortana topic, not stay_golden
+    assert "stay_golden" not in argv
+    assert "Acme sent you $4,200.00" in argv         # subject surfaced
+    assert "DKIM check failed" in argv               # decision.reasons surfaced
+
+
+def test_ping_on_near_miss_recipient_match_bad_subject(monkeypatch):
+    fake, argv_log = _fake_tg_send("pl-ping-recip-")
+    monkeypatch.setattr(pl, "TG_SEND", str(fake))
+
+    # finance+<code> recipient matches (real PO anchor) but the subject didn't parse.
+    d = pl.evaluate(["finance+po7@staygoldenhi.com"], _GOOD_AR,
+                    "Payment notification", [], "message.received")
+    assert d.qualified is False
+    assert pl.ping_near_miss(d, "Payment notification") is True
+    argv = argv_log.read_text()
+    assert "cortana" in argv
+    assert 'subject does not match' in argv          # decision.reasons surfaced
+
+
+def test_silent_on_spam_non_payment_shaped(monkeypatch):
+    fake, argv_log = _fake_tg_send("pl-silent-")
+    monkeypatch.setattr(pl, "TG_SEND", str(fake))
+
+    # Neither recipient nor subject matches -> a probe, no oracle, no ping.
+    d = pl.evaluate(["random@example.com"], {}, "You won a prize!!!",
+                    [], "message.received")
+    assert d.qualified is False
+    assert pl.ping_near_miss(d, "You won a prize!!!") is False
+    assert not argv_log.exists()                     # tg-send never invoked
+
+
 def test_spawn_cortana_invokes_spawn_coder_and_returns_handle(monkeypatch):
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="pl-spawn-"))
     argv_log = tmp / "argv.log"
