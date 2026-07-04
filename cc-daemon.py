@@ -66,6 +66,12 @@ ALLOWED_FROM = {
 # disables the secret check and restores the upstream is_authenticated() behavior.
 TRIGGER_SECRET = os.environ.get("CC_TRIGGER_SECRET", "").strip()
 
+# Lane 2 (payment lane): a second inbox watched on the same websocket. When set,
+# the daemon also subscribes to CC_LANE2_INBOX (e.g. cortana.h@agentmail.to) and
+# routes its mail through payment_lane (qualify -> spawn a Cortana session) instead
+# of the default Roland dispatch. Empty = disabled (upstream single-lane behavior).
+LANE2_INBOX = os.environ.get("CC_LANE2_INBOX", "").strip().lower()
+
 CC_HOME = pathlib.Path(
     os.environ.get("CC_HOME", pathlib.Path.home() / ".agentmail-cc")
 )
@@ -140,6 +146,11 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()],
 )
 log = logging.getLogger("cc-mail")
+
+# payment_lane sits alongside this script; ensure its dir is importable whether
+# the daemon is run directly (run-daemon.sh) or loaded via importlib (tests).
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import payment_lane  # noqa: E402
 
 _ADDR_RE = re.compile(r"<([^>]+)>")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -736,6 +747,73 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
         log.warning("mark-read skipped: %s", e)
 
 
+def handle_payment_lane(client: AgentMail, ev) -> None:
+    """Lane 2: qualify a cortana.h payment email and spawn a Cortana session.
+
+    Gate + spawn only. All money/reconciliation/Airtable logic lives in the vault
+    playbook the spawned session runs. Non-qualifying mail is ignored + logged.
+    """
+    msg = ev.message
+    raw_from = getattr(msg, "from_", None) or getattr(msg, "from", "")
+    sender = parse_from(raw_from)
+    subject = (msg.subject or "").strip()
+    body = _message_body(msg)
+    labels = list(msg.labels or [])
+    event_type = str(getattr(ev, "event_type", "") or "")
+    recipients = list(getattr(msg, "to", None) or [])
+    headers = dict(getattr(msg, "headers", None) or {})
+
+    decision = payment_lane.evaluate(recipients, headers, subject, labels, event_type)
+    if not decision.qualified:
+        log.info(
+            "LANE2 IGNORE non-qualifying inbox=%s from=%s subj=%r reasons=%s",
+            LANE2_INBOX, sender, subject, "; ".join(decision.reasons),
+        )
+        return
+
+    # Prominent surfacing of the fallback path so the first real payment reveals
+    # whether AgentMail exposes auth headers (plan §Email authentication).
+    if decision.dkim.verdict == "unknown":
+        log.warning(
+            "LANE2 DKIM-HEADERS-UNAVAILABLE — qualified on recipient+subject+"
+            "AgentMail-authenticated only. VERIFY AgentMail header exposure. detail=%s",
+            decision.dkim.detail,
+        )
+
+    log.info(
+        "LANE2 QUALIFIED case=%s code=%s payor=%r amount=%s dkim=%s(%s)",
+        decision.case_ref, decision.code, decision.payor, decision.amount,
+        decision.dkim.verdict, decision.dkim.strength,
+    )
+
+    prompt = payment_lane.build_cortana_prompt(
+        decision, raw_from, subject, body, thread_id=msg.thread_id, inbox=LANE2_INBOX
+    )
+    handle = payment_lane.spawn_cortana(decision, prompt)
+    if not handle:
+        # Leave unread so a fixed terminal reprocesses on the next event/restart.
+        log.error("LANE2 SPAWN FAILED case=%s; leaving unread msg=%s",
+                  decision.case_ref, msg.message_id)
+        return
+
+    log.info("LANE2 SPAWNED cortana handle=%s case=%s", handle, decision.case_ref)
+    try:
+        client.inboxes.messages.update(
+            inbox_id=LANE2_INBOX, message_id=msg.message_id, remove_labels=["unread"]
+        )
+    except Exception as e:
+        log.warning("LANE2 mark-read skipped: %s", e)
+
+
+def route_event(client: AgentMail, ev) -> None:
+    """Dispatch a received message to the right lane by inbox."""
+    inbox = (getattr(ev.message, "inbox_id", "") or "").lower()
+    if LANE2_INBOX and inbox == LANE2_INBOX:
+        handle_payment_lane(client, ev)
+    else:
+        handle_message(client, ev)
+
+
 def primitive_reply_failure(detail: dict, subject: str) -> None:
     email_id = detail.get("id")
     if not email_id:
@@ -848,21 +926,24 @@ def run_primitive_loop() -> None:
 def run_agentmail_loop() -> None:
     if AgentMail is None:
         raise RuntimeError("install the agentmail package or set CC_MAIL_PROVIDER=primitive")
+    sub_inboxes = [INBOX]
+    if LANE2_INBOX and LANE2_INBOX != INBOX:
+        sub_inboxes.append(LANE2_INBOX)
     log.info(
-        "starting cc-mail daemon provider=agentmail inbox=%s terminal=%s allowed=%s",
-        INBOX, TERMINAL, sorted(ALLOWED_FROM),
+        "starting cc-mail daemon provider=agentmail inboxes=%s terminal=%s allowed=%s lane2=%s",
+        sub_inboxes, TERMINAL, sorted(ALLOWED_FROM), LANE2_INBOX or "(disabled)",
     )
     while True:
         try:
             client = AgentMail()
             with client.websockets.connect() as socket:
-                socket.send_subscribe(Subscribe(inbox_ids=[INBOX]))
+                socket.send_subscribe(Subscribe(inbox_ids=sub_inboxes))
                 for event in socket:
                     if isinstance(event, Subscribed):
                         log.info("subscribed: %s", event.inbox_ids)
                     elif isinstance(event, MessageReceivedEvent):
                         try:
-                            handle_message(client, event)
+                            route_event(client, event)
                         except Exception:
                             log.exception("handler crashed")
         except Exception:
