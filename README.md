@@ -54,6 +54,45 @@ is unavailable or `get_thread` errors, the agent falls back to any quoted text i
 the body, so the feature is strictly additive — worst case is the prior behavior.
 The Primitive backend passes no `thread_id` and renders no thread block.
 
+### Payment lane (lane 2) — Mercury GPO payments
+
+Set `CC_LANE2_INBOX` (e.g. `cortana.h@agentmail.to`) to run a **second lane** on
+the same websocket. The org-scoped `AGENTMAIL_API_KEY` subscribes to both inboxes;
+`route_event` dispatches by `inbox_id`. Lane-1 mail (`AGENTMAIL_INBOX`) keeps the
+default Roland dispatch; lane-2 mail runs through `payment_lane.py`, which **only
+gates and spawns** — all money/reconciliation/Airtable logic lives in the vault
+playbook the spawned session runs.
+
+A lane-2 email qualifies only if **all three** hold:
+
+1. **Recipient** matches `finance+<code>@staygoldenhi.com` (`<code>` is the
+   dedup/PO anchor). Scanned across the parsed `To`/`Cc` and the `Delivered-To` /
+   `X-Forwarded-To` / `X-Original-To` headers, so it still matches when a Gmail
+   auto-forward rewrote the envelope recipient.
+2. **Subject** matches `"<payor> sent you $X"`.
+3. **DKIM `d=staygoldenhi.com`** is verifiable from the raw headers — layered and
+   **fail-closed**: (a) an `Authentication-Results` clause with `dkim=pass` +
+   `staygoldenhi.com`; else (b) a `DKIM-Signature` carrying `d=staygoldenhi.com`,
+   trusted only if AgentMail also marked the message authenticated; else (c)
+   **unknown** — AgentMail exposed no auth headers, which is logged **prominently**
+   (`LANE2 DKIM-HEADERS-UNAVAILABLE`) and the mail is gated on recipient + subject
+   + AgentMail's own auth verdict (per the plan's fallback). A present-but-wrong
+   DKIM domain is rejected.
+
+On a qualifying email the lane writes a Cortana brief to
+`CC_HOME/payment-prompts/<case-ref>.md` and spawns a **Cortana** session via
+`spawn-coder.sh --repo ~/Cortana` (so `CLAUDE_LAUNCH_CWD=~/Cortana` boots Cortana's
+identity, **not** Roland's), briefed with the email content + "run the logging
+mercury GPO payment playbook for this email". The case ref (`MERC-<code>`) ties the
+session to Telegram: the playbook posts the write-set to the `stay_golden` topic
+via the [telegram-gateway](../telegram-gateway) `tg-send --case-ref MERC-<code>`,
+and Rony's Approve/Reject taps route back into this same session. Non-qualifying
+mail to lane 2 is **ignored and logged** (no reply, no dispatch).
+
+Because this lane spawns Cortana (who reads the vault) and never deploys, it
+replaces the archived `sg-finance-agent` whose sin was being deployed — cut off
+from the vault. See `payment_lane.py` and `docs/plans/`.
+
 ## Requirements
 
 - macOS (AppleScript, launchd)
@@ -245,8 +284,12 @@ dispatch.
 ## Tests
 
 ```bash
-./venv/bin/pytest test_cc_daemon.py -v
+./venv/bin/pytest -q          # all lanes: daemon, reply, payment gate
 ```
+
+The payment-lane tests (`test_payment_lane.py`) cover each gate layer
+(recipient / subject / DKIM incl. the headers-unavailable fallback) and spawn the
+Cortana session against a fake `spawn-coder.sh` (test-coder.sh fake-binary style).
 
 ## Security notes
 
@@ -256,10 +299,11 @@ dispatch.
 
 ## Files
 
-- `cc-daemon.py` - the daemon (both backends)
+- `cc-daemon.py` - the daemon (both backends, lane router)
+- `payment_lane.py` - lane 2: the cortana.h qualify-and-spawn gate for the Mercury flow
 - `setup_cmux.py` - one-shot helper to open cmux's socket to the daemon (cmux backend)
 - `run-daemon.sh` - sources `cc.env` and execs the daemon
-- `test_cc_daemon.py` - unit tests
+- `test_cc_daemon.py` / `test_cc_reply.py` / `test_payment_lane.py` - unit tests
 - `com.agentmail.cc.plist.example` - launchd job template
 - `cc.env.example` - env template
 - `examples/send_task.py` - minimal sender to trigger the daemon from any allowlisted inbox

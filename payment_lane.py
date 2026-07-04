@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Payment lane — the cortana.h qualify-and-spawn gate for the Mercury flow.
+
+This is lane 2 of the daemon (see cc-daemon.py). It watches cortana.h@agentmail.to
+and, for a *qualifying* Mercury GPO payment email, spawns a **Cortana** cmux
+session (identity booted via CLAUDE_LAUNCH_CWD=~/Cortana) briefed to run the
+`logging mercury GPO payment` playbook. Non-qualifying mail is ignored + logged.
+
+This module ONLY gates and spawns. The payment/reconciliation/Airtable logic
+lives in the vault playbook (single source of truth) — never here.
+
+A qualifying email must satisfy all three:
+  1. recipient matches finance+<code>@staygoldenhi.com   (code = dedup/PO anchor)
+  2. subject matches "<payor> sent you $X"
+  3. DKIM d=staygoldenhi.com is verifiable from the raw headers
+
+Every Gmail auto-forward off a @staygoldenhi.com alias carries a d=staygoldenhi.com
+DKIM signature (gate layer 1: a direct spoof to cortana.h can't produce it). The
+DKIM check is layered and *fails closed*, and if AgentMail exposes no auth headers
+it logs prominently and gates on recipient + subject + AgentMail's own auth verdict
+(per the plan's fallback).
+
+The pure functions (extract_finance_code / parse_payment_subject / dkim_check /
+evaluate) take plain values so they unit-test without the AgentMail SDK.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass, field
+
+log = logging.getLogger("cc-mail")
+
+# --- config (env-overridable, mirrors cc-daemon.py style) --------------------
+
+CORTANA_REPO = os.environ.get("CC_CORTANA_REPO", "/Users/hayecom/Cortana")
+SPAWN_CODER = os.environ.get(
+    "SPAWN_CODER",
+    str(pathlib.Path.home() / "Workspace" / "tools" / "spawn-coder" / "spawn-coder.sh"),
+)
+PROMPT_ROOT = pathlib.Path(
+    os.environ.get("CC_HOME", pathlib.Path.home() / ".agentmail-cc")
+) / "payment-prompts"
+# Which Telegram bucket the playbook posts the write-set / escalations to.
+TELEGRAM_TOPIC = os.environ.get("CC_LANE2_TOPIC", "stay_golden")
+TG_SEND = os.environ.get(
+    "TG_SEND",
+    str(pathlib.Path.home() / "Workspace" / "tools" / "telegram-gateway" / "tg-send"),
+)
+PLAYBOOK = "logging mercury GPO payment"
+SPAWN_TIMEOUT_S = int(os.environ.get("CC_LANE2_SPAWN_TIMEOUT", "300"))
+
+# --- gate regexes ------------------------------------------------------------
+
+_RECIP_RE = re.compile(r"finance\+([A-Za-z0-9._-]+)@staygoldenhi\.com", re.I)
+# "<payor> sent you $4,200.00" — payor is everything before " sent you ".
+_SUBJECT_RE = re.compile(
+    r"^\s*(?P<payor>.+?)\s+sent\s+you\s+\$?\s*(?P<amount>[\d,]+(?:\.\d{1,2})?)",
+    re.I,
+)
+# Header names (case-insensitive) that can carry the true recipient through a
+# Gmail auto-forward. `to`/`cc` come from the parsed message; the X-/Delivered
+# forms survive forwarding when the envelope recipient has been rewritten.
+_RECIPIENT_HEADER_KEYS = (
+    "delivered-to", "x-forwarded-to", "x-original-to", "to", "cc",
+)
+_SAFE_CASE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _ci_headers(headers: dict | None) -> dict:
+    return {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+
+
+def extract_finance_code(recipients: list[str] | None, headers: dict | None) -> str | None:
+    """Return <code> if any recipient matches finance+<code>@staygoldenhi.com."""
+    h = _ci_headers(headers)
+    candidates: list[str] = list(recipients or [])
+    for key in _RECIPIENT_HEADER_KEYS:
+        if h.get(key):
+            candidates.append(h[key])
+    for c in candidates:
+        m = _RECIP_RE.search(c or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def parse_payment_subject(subject: str | None) -> tuple[str, str] | None:
+    """(payor, amount) from "<payor> sent you $X", or None."""
+    m = _SUBJECT_RE.search(subject or "")
+    if not m:
+        return None
+    payor = m.group("payor").strip()
+    amount = m.group("amount").replace(",", "")
+    if not payor:
+        return None
+    return payor, amount
+
+
+@dataclass
+class DkimResult:
+    verdict: str          # "pass" | "fail" | "unknown"
+    strength: str         # "strong" | "medium" | "present-no-match" | "unavailable"
+    authed: bool          # AgentMail's own auth verdict (not the DKIM domain check)
+    detail: str
+
+
+def dkim_check(headers: dict | None, labels: list[str] | None, event_type: str) -> DkimResult:
+    """Verify DKIM d=staygoldenhi.com from raw headers, layered + fail-closed.
+
+    Preference: (1) an Authentication-Results clause with dkim=pass AND
+    staygoldenhi.com; else (2) a DKIM-Signature carrying d=staygoldenhi.com,
+    trusted only if AgentMail also marked the message authenticated; else
+    (3) unknown — no usable auth headers exposed (caller logs + gates on the rest).
+    """
+    h = _ci_headers(headers)
+    labels = [str(x).lower() for x in (labels or [])]
+    authed = "unauthenticated" not in labels and event_type != "message.received.unauthenticated"
+
+    ar = h.get("authentication-results") or h.get("arc-authentication-results") or ""
+    if ar:
+        for clause in ar.split(";"):
+            c = clause.strip().lower()
+            if re.search(r"\bdkim\s*=\s*pass\b", c) and "staygoldenhi.com" in c:
+                return DkimResult("pass", "strong", authed,
+                                  f"Authentication-Results dkim=pass staygoldenhi.com")
+
+    sig = h.get("dkim-signature") or ""
+    if sig and "d=staygoldenhi.com" in sig.replace(" ", "").lower():
+        if authed:
+            return DkimResult("pass", "medium", authed,
+                              "DKIM-Signature d=staygoldenhi.com + AgentMail authenticated")
+        return DkimResult("fail", "medium", authed,
+                          "DKIM-Signature d=staygoldenhi.com but AgentMail flagged unauthenticated")
+
+    if not ar and not sig:
+        return DkimResult("unknown", "unavailable", authed,
+                          "no Authentication-Results / DKIM-Signature headers exposed by AgentMail")
+
+    # Auth headers present but no staygoldenhi.com DKIM pass -> spoof/misalign, reject.
+    return DkimResult("fail", "present-no-match", authed,
+                      f"auth headers present but no d=staygoldenhi.com dkim pass (ar={ar[:120]!r})")
+
+
+@dataclass
+class Decision:
+    qualified: bool
+    code: str | None
+    payor: str | None
+    amount: str | None
+    dkim: DkimResult
+    case_ref: str | None
+    reasons: list[str] = field(default_factory=list)
+
+
+def _case_ref(code: str) -> str:
+    return ("MERC-" + _SAFE_CASE_RE.sub("-", code))[:48]
+
+
+def evaluate(
+    recipients: list[str] | None,
+    headers: dict | None,
+    subject: str | None,
+    labels: list[str] | None,
+    event_type: str,
+) -> Decision:
+    """Combine the three gate layers into a qualify/ignore decision."""
+    reasons: list[str] = []
+    code = extract_finance_code(recipients, headers)
+    subj = parse_payment_subject(subject)
+    dk = dkim_check(headers, labels, event_type)
+
+    if code is None:
+        reasons.append("recipient does not match finance+<code>@staygoldenhi.com")
+    if subj is None:
+        reasons.append('subject does not match "<payor> sent you $X"')
+
+    if dk.verdict == "pass":
+        dkim_ok = True
+    elif dk.verdict == "unknown":
+        # Fallback path (plan §Email authentication): no auth headers exposed, so
+        # gate on the rest + AgentMail's own verdict. Caller logs this prominently.
+        dkim_ok = dk.authed
+        reasons.append(
+            f"DKIM headers unavailable ({dk.detail}); gating on recipient+subject+"
+            f"AgentMail-authenticated(authed={dk.authed})"
+        )
+    else:
+        dkim_ok = False
+        reasons.append(f"DKIM check failed ({dk.detail})")
+
+    payor, amount = subj if subj else (None, None)
+    qualified = code is not None and subj is not None and dkim_ok
+    return Decision(
+        qualified=qualified,
+        code=code,
+        payor=payor,
+        amount=amount,
+        dkim=dk,
+        case_ref=_case_ref(code) if code else None,
+        reasons=reasons,
+    )
+
+
+# --- Cortana spawn -----------------------------------------------------------
+
+def build_cortana_prompt(
+    decision: Decision,
+    raw_from: str,
+    subject: str,
+    body: str,
+    thread_id: str | None,
+    inbox: str,
+) -> str:
+    """The brief written to a file and handed to the spawned Cortana session."""
+    thread_block = ""
+    if thread_id:
+        thread_block = (
+            f"This message is AgentMail thread {thread_id} in inbox {inbox}. Call "
+            f"the AgentMail MCP get_thread tool (inboxId=\"{inbox}\", "
+            f"threadId=\"{thread_id}\") to load full thread history before acting.\n\n"
+        )
+    tg_guidance = (
+        f"Post the write-set / escalations to the Telegram '{TELEGRAM_TOPIC}' topic "
+        f"using this exact case ref so Rony's taps route back to THIS session:\n"
+        f"  {TG_SEND} --topic {TELEGRAM_TOPIC} --case-ref {decision.case_ref} "
+        f"--spawn-repo {CORTANA_REPO} --text \"...\" "
+        f"--button \"Approve:approve\" --button \"Reject:reject:destructive\"\n"
+        f"(During the supervised rollout: post the full intended write-set with "
+        f"Approve/Reject and write only on Approve. Once autonomous: buttons only "
+        f"on escalations.)\n"
+    )
+    return (
+        f"A qualifying Mercury GPO payment email arrived at {inbox}. You are "
+        f"Cortana. Run the vault playbook end to end for this email.\n\n"
+        f"TASK: Read [[{PLAYBOOK}]] from Rony's Brain and run it for this payment. "
+        f"The playbook is the single source of truth for parse → reconcile → "
+        f"write/escalate → Airtable. Do NOT improvise the money logic.\n\n"
+        f"Case ref: {decision.case_ref}\n"
+        f"Parsed by the gate (verify against the body): payor={decision.payor!r}, "
+        f"amount=${decision.amount}, finance code={decision.code!r}\n"
+        f"DKIM gate: {decision.dkim.verdict} ({decision.dkim.strength}) — "
+        f"{decision.dkim.detail}\n\n"
+        f"{thread_block}"
+        f"From: {raw_from}\n"
+        f"Subject: {subject}\n\n"
+        f"{body}\n\n"
+        f"---\n"
+        f"{tg_guidance}"
+    )
+
+
+def spawn_cortana(decision: Decision, prompt_text: str) -> str | None:
+    """Write the brief to a file and spawn a Cortana cmux session on it.
+
+    Reuses spawn-coder.sh: --repo ~/Cortana sets CLAUDE_LAUNCH_CWD so Cortana's
+    identity boots (NOT Roland). Returns the workspace handle, or None on failure.
+    """
+    PROMPT_ROOT.mkdir(parents=True, exist_ok=True)
+    ref = decision.case_ref or "MERC-unknown"
+    prompt_path = PROMPT_ROOT / f"{ref}.md"
+    prompt_path.write_text(prompt_text)
+
+    if not os.access(SPAWN_CODER, os.X_OK):
+        log.error("LANE2 spawn-coder not executable: %s", SPAWN_CODER)
+        return None
+
+    brief = (
+        f"A qualifying Mercury payment email arrived at cortana.h (case {ref}). "
+        f"Read and run the playbook described in this file: {prompt_path}"
+    )
+    cmd = [
+        SPAWN_CODER,
+        "--repo", CORTANA_REPO,
+        "--brief", brief,
+        "--title", f"Cortana: mercury {ref}",
+    ]
+    log.info("LANE2 spawning cortana: %s", " ".join(shlex.quote(c) for c in cmd))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=SPAWN_TIMEOUT_S)
+    except Exception as e:
+        log.error("LANE2 spawn-coder invocation failed: %s", e)
+        return None
+    handle = None
+    for ln in reversed((r.stdout or "").splitlines()):
+        m = re.search(r"workspace:\d+", ln)
+        if m:
+            handle = m.group(0)
+            break
+    if not handle:
+        log.error("LANE2 spawn-coder no handle (rc=%s stderr=%s)",
+                  r.returncode, (r.stderr or "")[:300])
+    return handle
+
+
+if __name__ == "__main__":
+    # Tiny CLI probe: pipe a raw subject/recipient to see the gate decision.
+    print("payment_lane gate self-check", file=sys.stderr)
+    d = evaluate(
+        ["finance+po1183@staygoldenhi.com"],
+        {"Authentication-Results": "mx.google.com; dkim=pass header.i=@staygoldenhi.com"},
+        "Acme Corp sent you $4,200.00",
+        [], "message.received",
+    )
+    print(d)
