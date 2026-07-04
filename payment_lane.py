@@ -49,10 +49,17 @@ PROMPT_ROOT = pathlib.Path(
 ) / "payment-prompts"
 # Which Telegram bucket the playbook posts the write-set / escalations to.
 TELEGRAM_TOPIC = os.environ.get("CC_LANE2_TOPIC", "stay_golden")
+# Where near-miss pings land: a *payment-shaped* email that failed one gate layer
+# (e.g. DKIM showed mercury.com on auto-forwarded mail) would otherwise die in the
+# log. It goes to the operator's own 'cortana' topic — NOT stay_golden — because
+# it's a tuning signal, not a payment to action.
+NEAR_MISS_TOPIC = os.environ.get("CC_LANE2_NEAR_MISS_TOPIC", "cortana")
 TG_SEND = os.environ.get(
     "TG_SEND",
     str(pathlib.Path.home() / "Workspace" / "tools" / "telegram-gateway" / "tg-send"),
 )
+# tg-send is a fast local post; don't share the 5-minute spawn budget with it.
+TG_SEND_TIMEOUT_S = int(os.environ.get("CC_LANE2_PING_TIMEOUT", "30"))
 PLAYBOOK = "logging mercury GPO payment"
 SPAWN_TIMEOUT_S = int(os.environ.get("CC_LANE2_SPAWN_TIMEOUT", "300"))
 
@@ -206,6 +213,54 @@ def evaluate(
         case_ref=_case_ref(code) if code else None,
         reasons=reasons,
     )
+
+
+# --- near-miss ping ----------------------------------------------------------
+
+def is_payment_shaped(decision: Decision) -> bool:
+    """True if a *non-qualifying* email still looks like a Mercury payment.
+
+    Payment-shaped = the subject parsed as "<payor> sent you $X" (payor is set)
+    OR a recipient/header matched finance+<code>@staygoldenhi.com (code is set).
+    Either one is enough: a real payment that trips a single gate layer (the known
+    first-sample risk is DKIM showing mercury.com on auto-forwarded mail) is worth
+    surfacing for tuning. Mail matching neither is an unsolicited probe — there's no
+    oracle for it, so it stays silent.
+    """
+    return decision.code is not None or decision.payor is not None
+
+
+def ping_near_miss(decision: Decision, subject: str) -> bool:
+    """Post a terse near-miss ping to the 'cortana' topic so a payment-shaped email
+    that didn't qualify surfaces for tuning instead of dying in the log.
+
+    No-op for non-payment-shaped mail (probes get no oracle). Returns True only if a
+    ping was actually sent — the daemon logs that alongside its LANE2 IGNORE line.
+    """
+    if not is_payment_shaped(decision):
+        return False
+    if not os.access(TG_SEND, os.X_OK):
+        log.error("LANE2 near-miss ping skipped: tg-send not executable: %s", TG_SEND)
+        return False
+
+    reasons = "; ".join(decision.reasons) or "(no reasons recorded)"
+    text = (
+        f"⚠️ Mercury near-miss: payment-shaped mail did NOT qualify.\n"
+        f"subject: {subject or '(no subject)'}\n"
+        f"reasons: {reasons}"
+    )
+    cmd = [TG_SEND, "--topic", NEAR_MISS_TOPIC, "--text", text]
+    log.info("LANE2 near-miss ping topic=%s subj=%r", NEAR_MISS_TOPIC, subject)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TG_SEND_TIMEOUT_S)
+    except Exception as e:
+        log.error("LANE2 near-miss ping invocation failed: %s", e)
+        return False
+    if r.returncode != 0:
+        log.error("LANE2 near-miss ping rc=%s stderr=%s",
+                  r.returncode, (r.stderr or "")[:300])
+        return False
+    return True
 
 
 # --- Cortana spawn -----------------------------------------------------------

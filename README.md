@@ -89,6 +89,16 @@ via the [telegram-gateway](../telegram-gateway) `tg-send --case-ref MERC-<code>`
 and Rony's Approve/Reject taps route back into this same session. Non-qualifying
 mail to lane 2 is **ignored and logged** (no reply, no dispatch).
 
+**Near-miss ping.** A non-qualifying email that is still *payment-shaped* — the
+subject parsed as `"<payor> sent you $X"` **or** a recipient/header matched
+`finance+<code>@staygoldenhi.com` — is a likely real payment that tripped a single
+gate layer (the known first-sample risk: DKIM showing `mercury.com` on
+auto-forwarded mail). Rather than let it die in the log, the lane posts a terse
+`tg-send` ping (subject + the decision's `reasons`) to the **`cortana`** topic
+(`CC_LANE2_NEAR_MISS_TOPIC`, *not* `stay_golden`) so near-misses surface for
+tuning. Mail matching neither gate is an unsolicited probe with no oracle, so it
+stays silent.
+
 Because this lane spawns Cortana (who reads the vault) and never deploys, it
 replaces the archived `sg-finance-agent` whose sin was being deployed — cut off
 from the vault. See `payment_lane.py` and `docs/plans/`.
