@@ -69,15 +69,21 @@ A lane-2 email qualifies only if **all three** hold:
    dedup/PO anchor). Scanned across the parsed `To`/`Cc` and the `Delivered-To` /
    `X-Forwarded-To` / `X-Original-To` headers, so it still matches when a Gmail
    auto-forward rewrote the envelope recipient.
-2. **Subject** matches `"<payor> sent you $X"`.
-3. **DKIM `d=staygoldenhi.com`** is verifiable from the raw headers — layered and
-   **fail-closed**: (a) an `Authentication-Results` clause with `dkim=pass` +
-   `staygoldenhi.com`; else (b) a `DKIM-Signature` carrying `d=staygoldenhi.com`,
-   trusted only if AgentMail also marked the message authenticated; else (c)
-   **unknown** — AgentMail exposed no auth headers, which is logged **prominently**
-   (`LANE2 DKIM-HEADERS-UNAVAILABLE`) and the mail is gated on recipient + subject
-   + AgentMail's own auth verdict (per the plan's fallback). A present-but-wrong
-   DKIM domain is rejected.
+2. **Subject** matches `"<payor> sent you $X"`. A `Re:`/`Fwd:` prefix disqualifies
+   it — an auto-forwarded Mercury notification keeps its original subject, so those
+   prefixes mark a human reply or manual forward, not the payment itself.
+3. **DKIM** from an accepted signing domain is verifiable from the raw headers —
+   layered and **fail-closed**: (a) an `Authentication-Results` clause with
+   `dkim=pass` + an accepted domain; else (b) a `DKIM-Signature` carrying
+   `d=<accepted domain>`, trusted only if AgentMail also marked the message
+   authenticated; else (c) **unknown** — AgentMail exposed no auth headers, which is
+   logged **prominently** (`LANE2 DKIM-HEADERS-UNAVAILABLE`) and the mail is gated on
+   recipient + subject + AgentMail's own auth verdict (per the plan's fallback). A
+   present-but-wrong DKIM domain is rejected. Accepted domains are `staygoldenhi.com`
+   (the Gmail auto-forward's re-sign) plus Mercury's own `mg.mercury.com` / bare
+   `mercury.com` — because on a forwarded message the surviving `dkim=pass` is the
+   **origin** domain (Mercury signs `d=mg.mercury.com`, selector `pic`), not the SG
+   alias; the match is boundary-anchored so look-alikes (`evilmercury.com`) can't slip through.
 
 On a qualifying email the lane writes a Cortana brief to
 `CC_HOME/payment-prompts/<case-ref>.md` and spawns a **Cortana** session via
@@ -92,8 +98,8 @@ mail to lane 2 is **ignored and logged** (no reply, no dispatch).
 **Near-miss ping.** A non-qualifying email that is still *payment-shaped* — the
 subject parsed as `"<payor> sent you $X"` **or** a recipient/header matched
 `finance+<code>@staygoldenhi.com` — is a likely real payment that tripped a single
-gate layer (the known first-sample risk: DKIM showing `mercury.com` on
-auto-forwarded mail). Rather than let it die in the log, the lane posts a terse
+gate layer (e.g. DKIM showing an unrecognized origin domain on auto-forwarded
+mail). Rather than let it die in the log, the lane posts a terse
 `tg-send` ping (subject + the decision's `reasons`) to the **`cortana`** topic
 (`CC_LANE2_NEAR_MISS_TOPIC`, *not* `stay_golden`) so near-misses surface for
 tuning. Mail matching neither gate is an unsolicited probe with no oracle, so it

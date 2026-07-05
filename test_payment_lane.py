@@ -57,6 +57,25 @@ def test_subject_parse_rejects_unrelated():
     assert pl.parse_payment_subject(None) is None
 
 
+def test_reply_or_forward_prefix_is_not_a_payment_subject():
+    # Live 2026-07-04 16:46: a Gmail REPLY on a probe thread ("Re: Golden Hour
+    # Studios Inc. sent you $0.04") parsed as a payment (payor mis-parsed as
+    # "Re: Golden Hour...") and cost a session spawn. Auto-forwarded Mercury mail
+    # keeps the original subject verbatim — re:/fwd: only marks a human reply or
+    # manual forward, so it must NOT parse as a payment.
+    reply = "Re: Golden Hour Studios Inc. sent you $0.04"
+    assert pl.parse_payment_subject(reply) is None
+    assert pl.parse_payment_subject("Fwd: Acme Corp sent you $4,200.00") is None
+    assert pl.parse_payment_subject("fwd: Bob sent you 50") is None
+    # the un-prefixed original still parses fine
+    assert pl.parse_payment_subject("Golden Hour Studios Inc. sent you $0.04") \
+        == ("Golden Hour Studios Inc.", "0.04")
+    # and end to end: the reply no longer qualifies the gate (no spawn), even with a
+    # valid recipient + staygoldenhi DKIM pass (the exact 16:46 conditions).
+    d = pl.evaluate(["finance+cle@staygoldenhi.com"], _GOOD_AR, reply, [], "message.received")
+    assert d.qualified is False
+
+
 # --- DKIM gate ---------------------------------------------------------------
 
 def test_dkim_strong_pass_from_authentication_results():
@@ -70,6 +89,11 @@ def test_dkim_medium_pass_from_signature_when_authed():
     h = {"DKIM-Signature": "v=1; a=rsa-sha256; d=staygoldenhi.com; s=google; h=from:to"}
     r = pl.dkim_check(h, [], "message.received")
     assert r.verdict == "pass" and r.strength == "medium"
+    # Same acceptance for Mercury's own signing domain (d=mg.mercury.com, selector pic).
+    h = {"DKIM-Signature": "v=1; a=rsa-sha256; d=mg.mercury.com; s=pic; h=from:to"}
+    r = pl.dkim_check(h, [], "message.received")
+    assert r.verdict == "pass" and r.strength == "medium"
+    assert "mg.mercury.com" in r.detail
 
 
 def test_dkim_signature_but_unauthenticated_is_fail():
@@ -90,6 +114,16 @@ def test_dkim_present_but_wrong_domain_is_fail():
     assert r.verdict == "fail" and r.strength == "present-no-match"
 
 
+def test_dkim_lookalike_domains_do_not_slip_past_the_boundary():
+    # Accepting mercury.com must NOT accept a registrable look-alike (evilmercury.com)
+    # or a same-prefix subdomain trick (mercury.company.com). The domain match is
+    # boundary-anchored so a bare substring can't wave these through the payment gate.
+    for bad_domain in ("evilmercury.com", "mercury.company.com", "notstaygoldenhi.com"):
+        h = {"Authentication-Results": f"mx.google.com; dkim=pass header.i=@{bad_domain}"}
+        r = pl.dkim_check(h, [], "message.received")
+        assert r.verdict == "fail", f"{bad_domain} must not qualify"
+
+
 # --- evaluate (the combined decision) ----------------------------------------
 
 _GOOD_AR = {"Authentication-Results": "mx.google.com; dkim=pass header.i=@staygoldenhi.com"}
@@ -101,6 +135,19 @@ def test_evaluate_qualifies_all_three():
     assert d.qualified is True
     assert d.code == "po7" and d.payor == "Acme" and d.amount == "1000.00"
     assert d.case_ref == "MERC-po7"
+
+
+def test_evaluate_qualifies_with_forwarded_mercury_origin_dkim():
+    # Real probe shape (2026-07-04): on a Gmail auto-forward the surviving DKIM pass
+    # is Mercury's ORIGIN domain — dkim=pass header.i=@mg.mercury.com (selector pic) —
+    # not the staygoldenhi.com re-sign. Qualifies when recipient + subject also pass.
+    ar = {"Authentication-Results":
+          "mx.google.com; dkim=pass header.i=@mg.mercury.com header.s=pic; spf=pass"}
+    d = pl.evaluate(["finance+po7@staygoldenhi.com"], ar,
+                    "Golden Hour Studios Inc. sent you $38,548.70", [], "message.received")
+    assert d.qualified is True
+    assert d.dkim.verdict == "pass" and d.dkim.strength == "strong"
+    assert "mg.mercury.com" in d.dkim.detail
 
 
 def test_evaluate_rejects_bad_recipient():
@@ -190,9 +237,11 @@ def test_ping_on_near_miss_dkim_fail(monkeypatch):
     fake, argv_log = _fake_tg_send("pl-ping-")
     monkeypatch.setattr(pl, "TG_SEND", str(fake))
 
-    # Auto-forwarded Mercury mail: recipient + subject match, but DKIM shows
-    # mercury.com (the first-sample tuning risk) instead of staygoldenhi.com.
-    bad = {"Authentication-Results": "mx; dkim=pass header.i=@mercury.com"}
+    # Auto-forwarded mail: recipient + subject match, but the surviving DKIM pass is
+    # an unrecognized origin domain — here the sender's personal gmail signing domain
+    # (per the 2026-07-04 probe), not SG's re-sign or Mercury's mg.mercury.com.
+    bad = {"Authentication-Results":
+           "mx.google.com; dkim=pass header.i=@ronyhay-com.20251104.gappssmtp.com"}
     d = pl.evaluate(["finance+po7@staygoldenhi.com"], bad,
                     "Acme sent you $4,200.00", [], "message.received")
     assert d.qualified is False
