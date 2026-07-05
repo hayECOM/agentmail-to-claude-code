@@ -12,13 +12,16 @@ lives in the vault playbook (single source of truth) — never here.
 A qualifying email must satisfy all three:
   1. recipient matches finance+<code>@staygoldenhi.com   (code = dedup/PO anchor)
   2. subject matches "<payor> sent you $X"
-  3. DKIM d=staygoldenhi.com is verifiable from the raw headers
+  3. DKIM from an accepted signing domain is verifiable from the raw headers
 
-Every Gmail auto-forward off a @staygoldenhi.com alias carries a d=staygoldenhi.com
-DKIM signature (gate layer 1: a direct spoof to cortana.h can't produce it). The
-DKIM check is layered and *fails closed*, and if AgentMail exposes no auth headers
-it logs prominently and gates on recipient + subject + AgentMail's own auth verdict
-(per the plan's fallback).
+On a Gmail auto-forward the surviving DKIM pass is the ORIGIN domain, not the
+staygoldenhi.com re-sign: Mercury signs d=mg.mercury.com (selector pic), and
+Google's Authentication-Results carries it through as dkim=pass
+header.i=@mg.mercury.com. So the gate accepts the staygoldenhi.com alias AND
+Mercury's own signing domains (_ACCEPTED_DKIM_DOMAINS) — a direct spoof to
+cortana.h can produce none of them. The DKIM check is layered and *fails closed*,
+and if AgentMail exposes no auth headers it logs prominently and gates on
+recipient + subject + AgentMail's own auth verdict (per the plan's fallback).
 
 The pure functions (extract_finance_code / parse_payment_subject / dkim_check /
 evaluate) take plain values so they unit-test without the AgentMail SDK.
@@ -50,9 +53,9 @@ PROMPT_ROOT = pathlib.Path(
 # Which Telegram bucket the playbook posts the write-set / escalations to.
 TELEGRAM_TOPIC = os.environ.get("CC_LANE2_TOPIC", "stay_golden")
 # Where near-miss pings land: a *payment-shaped* email that failed one gate layer
-# (e.g. DKIM showed mercury.com on auto-forwarded mail) would otherwise die in the
-# log. It goes to the operator's own 'cortana' topic — NOT stay_golden — because
-# it's a tuning signal, not a payment to action.
+# (e.g. DKIM showed an unrecognized origin domain on auto-forwarded mail) would
+# otherwise die in the log. It goes to the operator's own 'cortana' topic — NOT
+# stay_golden — because it's a tuning signal, not a payment to action.
 NEAR_MISS_TOPIC = os.environ.get("CC_LANE2_NEAR_MISS_TOPIC", "cortana")
 TG_SEND = os.environ.get(
     "TG_SEND",
@@ -118,13 +121,38 @@ class DkimResult:
     detail: str
 
 
-def dkim_check(headers: dict | None, labels: list[str] | None, event_type: str) -> DkimResult:
-    """Verify DKIM d=staygoldenhi.com from raw headers, layered + fail-closed.
+# DKIM signing domains that prove a genuine Mercury GPO payment notification. On a
+# Gmail auto-forward the surviving DKIM pass is the ORIGIN domain — Mercury signs
+# d=mg.mercury.com (selector pic), not the staygoldenhi.com re-sign — so we accept
+# the SG alias AND Mercury's own signing domains. Bare mercury.com is kept as a
+# defensive catch in case a forwarding path reports the org domain instead of the
+# mg. subdomain. See README (lane 2).
+_ACCEPTED_DKIM_DOMAINS = ("staygoldenhi.com", "mg.mercury.com", "mercury.com")
 
-    Preference: (1) an Authentication-Results clause with dkim=pass AND
-    staygoldenhi.com; else (2) a DKIM-Signature carrying d=staygoldenhi.com,
-    trusted only if AgentMail also marked the message authenticated; else
-    (3) unknown — no usable auth headers exposed (caller logs + gates on the rest).
+
+def _accepted_dkim_domain(text: str) -> str | None:
+    """First accepted DKIM domain appearing in `text` at a domain boundary, else
+    None. Anchored on both sides so a look-alike (evilmercury.com,
+    mercury.company.com) can't slip past what a bare substring would wave through.
+    `text` is expected already lowercased.
+    """
+    for d in _ACCEPTED_DKIM_DOMAINS:
+        if re.search(rf"(?:^|[^a-z0-9.-]){re.escape(d)}(?![a-z0-9.-])", text):
+            return d
+    return None
+
+
+def dkim_check(headers: dict | None, labels: list[str] | None, event_type: str) -> DkimResult:
+    """Verify DKIM from an accepted signing domain, layered + fail-closed.
+
+    Accepted domains (_ACCEPTED_DKIM_DOMAINS): the staygoldenhi.com re-sign AND
+    Mercury's own signing domains — on a Gmail auto-forward the surviving DKIM pass
+    is the ORIGIN (d=mg.mercury.com), not the SG alias.
+
+    Preference: (1) an Authentication-Results clause with dkim=pass AND an accepted
+    domain; else (2) a DKIM-Signature carrying d=<accepted domain>, trusted only if
+    AgentMail also marked the message authenticated; else (3) unknown — no usable
+    auth headers exposed (caller logs + gates on the rest).
     """
     h = _ci_headers(headers)
     labels = [str(x).lower() for x in (labels or [])]
@@ -134,25 +162,32 @@ def dkim_check(headers: dict | None, labels: list[str] | None, event_type: str) 
     if ar:
         for clause in ar.split(";"):
             c = clause.strip().lower()
-            if re.search(r"\bdkim\s*=\s*pass\b", c) and "staygoldenhi.com" in c:
-                return DkimResult("pass", "strong", authed,
-                                  f"Authentication-Results dkim=pass staygoldenhi.com")
+            if re.search(r"\bdkim\s*=\s*pass\b", c):
+                matched = _accepted_dkim_domain(c)
+                if matched:
+                    return DkimResult("pass", "strong", authed,
+                                      f"Authentication-Results dkim=pass {matched}")
 
-    sig = h.get("dkim-signature") or ""
-    if sig and "d=staygoldenhi.com" in sig.replace(" ", "").lower():
+    sig = (h.get("dkim-signature") or "").replace(" ", "").lower()
+    sig_domain = next(
+        (d for d in _ACCEPTED_DKIM_DOMAINS
+         if re.search(rf"(?:^|;)d={re.escape(d)}(?:;|$)", sig)),
+        None,
+    )
+    if sig_domain:
         if authed:
             return DkimResult("pass", "medium", authed,
-                              "DKIM-Signature d=staygoldenhi.com + AgentMail authenticated")
+                              f"DKIM-Signature d={sig_domain} + AgentMail authenticated")
         return DkimResult("fail", "medium", authed,
-                          "DKIM-Signature d=staygoldenhi.com but AgentMail flagged unauthenticated")
+                          f"DKIM-Signature d={sig_domain} but AgentMail flagged unauthenticated")
 
     if not ar and not sig:
         return DkimResult("unknown", "unavailable", authed,
                           "no Authentication-Results / DKIM-Signature headers exposed by AgentMail")
 
-    # Auth headers present but no staygoldenhi.com DKIM pass -> spoof/misalign, reject.
+    # Auth headers present but no accepted DKIM pass -> spoof/misalign, reject.
     return DkimResult("fail", "present-no-match", authed,
-                      f"auth headers present but no d=staygoldenhi.com dkim pass (ar={ar[:120]!r})")
+                      f"auth headers present but no accepted dkim=pass domain (ar={ar[:120]!r})")
 
 
 @dataclass
@@ -222,10 +257,10 @@ def is_payment_shaped(decision: Decision) -> bool:
 
     Payment-shaped = the subject parsed as "<payor> sent you $X" (payor is set)
     OR a recipient/header matched finance+<code>@staygoldenhi.com (code is set).
-    Either one is enough: a real payment that trips a single gate layer (the known
-    first-sample risk is DKIM showing mercury.com on auto-forwarded mail) is worth
-    surfacing for tuning. Mail matching neither is an unsolicited probe — there's no
-    oracle for it, so it stays silent.
+    Either one is enough: a real payment that trips a single gate layer (e.g. DKIM
+    showing an unrecognized origin domain on auto-forwarded mail) is worth surfacing
+    for tuning. Mail matching neither is an unsolicited probe — there's no oracle for
+    it, so it stays silent.
     """
     return decision.code is not None or decision.payor is not None
 
