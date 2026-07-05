@@ -57,6 +57,25 @@ def test_subject_parse_rejects_unrelated():
     assert pl.parse_payment_subject(None) is None
 
 
+def test_reply_or_forward_prefix_is_not_a_payment_subject():
+    # Live 2026-07-04 16:46: a Gmail REPLY on a probe thread ("Re: Golden Hour
+    # Studios Inc. sent you $0.04") parsed as a payment (payor mis-parsed as
+    # "Re: Golden Hour...") and cost a session spawn. Auto-forwarded Mercury mail
+    # keeps the original subject verbatim — re:/fwd: only marks a human reply or
+    # manual forward, so it must NOT parse as a payment.
+    reply = "Re: Golden Hour Studios Inc. sent you $0.04"
+    assert pl.parse_payment_subject(reply) is None
+    assert pl.parse_payment_subject("Fwd: Acme Corp sent you $4,200.00") is None
+    assert pl.parse_payment_subject("fwd: Bob sent you 50") is None
+    # the un-prefixed original still parses fine
+    assert pl.parse_payment_subject("Golden Hour Studios Inc. sent you $0.04") \
+        == ("Golden Hour Studios Inc.", "0.04")
+    # and end to end: the reply no longer qualifies the gate (no spawn), even with a
+    # valid recipient + staygoldenhi DKIM pass (the exact 16:46 conditions).
+    d = pl.evaluate(["finance+cle@staygoldenhi.com"], _GOOD_AR, reply, [], "message.received")
+    assert d.qualified is False
+
+
 # --- DKIM gate ---------------------------------------------------------------
 
 def test_dkim_strong_pass_from_authentication_results():

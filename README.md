@@ -69,7 +69,9 @@ A lane-2 email qualifies only if **all three** hold:
    dedup/PO anchor). Scanned across the parsed `To`/`Cc` and the `Delivered-To` /
    `X-Forwarded-To` / `X-Original-To` headers, so it still matches when a Gmail
    auto-forward rewrote the envelope recipient.
-2. **Subject** matches `"<payor> sent you $X"`.
+2. **Subject** matches `"<payor> sent you $X"`. A `Re:`/`Fwd:` prefix disqualifies
+   it — an auto-forwarded Mercury notification keeps its original subject, so those
+   prefixes mark a human reply or manual forward, not the payment itself.
 3. **DKIM** from an accepted signing domain is verifiable from the raw headers —
    layered and **fail-closed**: (a) an `Authentication-Results` clause with
    `dkim=pass` + an accepted domain; else (b) a `DKIM-Signature` carrying

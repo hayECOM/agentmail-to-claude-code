@@ -74,6 +74,10 @@ _SUBJECT_RE = re.compile(
     r"^\s*(?P<payor>.+?)\s+sent\s+you\s+\$?\s*(?P<amount>[\d,]+(?:\.\d{1,2})?)",
     re.I,
 )
+# A Mercury auto-forward preserves the original subject verbatim; a Re:/Fwd: prefix
+# only shows up on a human reply or manual forward — not the real-time notification.
+# (Live 2026-07-04 16:46: a Gmail reply parsed as a payment and cost a spawn.)
+_REPLY_FWD_PREFIX_RE = re.compile(r"^\s*(?:re|fwd)\s*:", re.I)
 # Header names (case-insensitive) that can carry the true recipient through a
 # Gmail auto-forward. `to`/`cc` come from the parsed message; the X-/Delivered
 # forms survive forwarding when the envelope recipient has been rewritten.
@@ -102,8 +106,16 @@ def extract_finance_code(recipients: list[str] | None, headers: dict | None) -> 
 
 
 def parse_payment_subject(subject: str | None) -> tuple[str, str] | None:
-    """(payor, amount) from "<payor> sent you $X", or None."""
-    m = _SUBJECT_RE.search(subject or "")
+    """(payor, amount) from "<payor> sent you $X", or None.
+
+    A Re:/Fwd: prefix disqualifies the subject: an auto-forwarded Mercury payment
+    keeps its original subject, so those prefixes mark a human reply or manual
+    forward — not the notification we spawn a session on.
+    """
+    s = subject or ""
+    if _REPLY_FWD_PREFIX_RE.match(s):
+        return None
+    m = _SUBJECT_RE.search(s)
     if not m:
         return None
     payor = m.group("payor").strip()
