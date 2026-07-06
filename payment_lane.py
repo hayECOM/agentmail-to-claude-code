@@ -10,9 +10,17 @@ This module ONLY gates and spawns. The payment/reconciliation/Airtable logic
 lives in the vault playbook (single source of truth) — never here.
 
 A qualifying email must satisfy all three:
-  1. recipient matches finance+<code>@staygoldenhi.com   (code = dedup/PO anchor)
+  1. recipient matches finance+<code>@staygoldenhi.com OR the lane-2 inbox's own
+     plus-address cortana.h+<code>@agentmail.to   (code = dedup/PO anchor)
   2. subject matches "<payor> sent you $X"
   3. DKIM from an accepted signing domain is verifiable from the raw headers
+
+The recipient gate accepts two shapes. The SG alias finance+<code>@staygoldenhi.com
+rides in on a Gmail auto-forward (the envelope was rewritten, so the true recipient
+survives in Delivered-To/X-Forwarded-To/X-Original-To). The lane-2 plus-address
+cortana.h+<code>@agentmail.to is the DIRECT path — Mercury sends straight to the
+AgentMail inbox and the To header survives intact. Its base is derived from
+CC_LANE2_INBOX (local part + domain), never hardcoded, so there's no second env var.
 
 On a Gmail auto-forward the surviving DKIM pass is the ORIGIN domain, not the
 staygoldenhi.com re-sign: Mercury signs d=mg.mercury.com (selector pic), and
@@ -65,6 +73,10 @@ TG_SEND = os.environ.get(
 TG_SEND_TIMEOUT_S = int(os.environ.get("CC_LANE2_PING_TIMEOUT", "30"))
 PLAYBOOK = "logging mercury GPO payment"
 SPAWN_TIMEOUT_S = int(os.environ.get("CC_LANE2_SPAWN_TIMEOUT", "300"))
+# The lane-2 inbox (mirrors cc-daemon.py's LANE2_INBOX). The accepted direct-send
+# recipient shape is DERIVED from this — cortana.h@agentmail.to admits
+# cortana.h+<code>@agentmail.to — so there is no separate recipient env var.
+LANE2_INBOX = os.environ.get("CC_LANE2_INBOX", "").strip().lower()
 
 # --- gate regexes ------------------------------------------------------------
 
@@ -91,17 +103,51 @@ def _ci_headers(headers: dict | None) -> dict:
     return {str(k).lower(): str(v) for k, v in (headers or {}).items()}
 
 
+def _lane2_recip_re() -> re.Pattern | None:
+    """Boundary-anchored recipient regex for the lane-2 inbox's plus-address,
+    DERIVED from CC_LANE2_INBOX (no separate env var): cortana.h@agentmail.to
+    admits cortana.h+<code>@agentmail.to. Returns None when the inbox is unset or
+    has no '@' (lane 2 disabled / malformed) — the finance+ shape still applies.
+
+    Anchored on BOTH sides in the PR-8 posture: the local part must sit on a
+    local-part boundary (so notcortana.h+cle@... and cortana.h.evil+cle@... do NOT
+    match) and the domain must end on a domain boundary (so ...@agentmail.to.evil.com
+    and ...@evilagentmail.to do NOT match). re.escape guards the local part's dot so
+    it can't behave as a wildcard.
+    """
+    local, sep, domain = LANE2_INBOX.partition("@")
+    if not sep or not local or not domain:
+        return None
+    return re.compile(
+        rf"(?:^|[^A-Za-z0-9._+-]){re.escape(local)}\+([A-Za-z0-9._-]+)"
+        rf"@{re.escape(domain)}(?![A-Za-z0-9.-])",
+        re.I,
+    )
+
+
 def extract_finance_code(recipients: list[str] | None, headers: dict | None) -> str | None:
-    """Return <code> if any recipient matches finance+<code>@staygoldenhi.com."""
+    """Return <code> if any recipient matches an accepted plus-address shape.
+
+    Two shapes qualify: the SG alias finance+<code>@staygoldenhi.com (survives a
+    Gmail auto-forward via Delivered-To/X-Forwarded-To/X-Original-To) AND the lane-2
+    inbox's own plus-address, derived from CC_LANE2_INBOX
+    (cortana.h@agentmail.to -> cortana.h+<code>@agentmail.to) for Mercury's direct
+    sends. Both are boundary-anchored (see _lane2_recip_re / PR-8 posture).
+    """
     h = _ci_headers(headers)
     candidates: list[str] = list(recipients or [])
     for key in _RECIPIENT_HEADER_KEYS:
         if h.get(key):
             candidates.append(h[key])
+    patterns = [_RECIP_RE]
+    lane2 = _lane2_recip_re()
+    if lane2 is not None:
+        patterns.append(lane2)
     for c in candidates:
-        m = _RECIP_RE.search(c or "")
-        if m:
-            return m.group(1)
+        for pat in patterns:
+            m = pat.search(c or "")
+            if m:
+                return m.group(1)
     return None
 
 
@@ -268,11 +314,12 @@ def is_payment_shaped(decision: Decision) -> bool:
     """True if a *non-qualifying* email still looks like a Mercury payment.
 
     Payment-shaped = the subject parsed as "<payor> sent you $X" (payor is set)
-    OR a recipient/header matched finance+<code>@staygoldenhi.com (code is set).
-    Either one is enough: a real payment that trips a single gate layer (e.g. DKIM
-    showing an unrecognized origin domain on auto-forwarded mail) is worth surfacing
-    for tuning. Mail matching neither is an unsolicited probe — there's no oracle for
-    it, so it stays silent.
+    OR a recipient/header matched an accepted plus-address — either the SG alias
+    finance+<code>@staygoldenhi.com or the lane-2 direct-send shape
+    cortana.h+<code>@agentmail.to — so decision.code is set. Either one is enough: a
+    real payment that trips a single gate layer (e.g. DKIM showing an unrecognized
+    origin domain) is worth surfacing for tuning. Mail matching neither is an
+    unsolicited probe — there's no oracle for it, so it stays silent.
     """
     return decision.code is not None or decision.payor is not None
 
