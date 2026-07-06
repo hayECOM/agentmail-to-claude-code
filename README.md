@@ -65,10 +65,20 @@ playbook the spawned session runs.
 
 A lane-2 email qualifies only if **all three** hold:
 
-1. **Recipient** matches `finance+<code>@staygoldenhi.com` (`<code>` is the
+1. **Recipient** matches one of two accepted plus-address shapes (`<code>` is the
    dedup/PO anchor). Scanned across the parsed `To`/`Cc` and the `Delivered-To` /
-   `X-Forwarded-To` / `X-Original-To` headers, so it still matches when a Gmail
-   auto-forward rewrote the envelope recipient.
+   `X-Forwarded-To` / `X-Original-To` headers:
+   - `finance+<code>@staygoldenhi.com` — the **Gmail auto-forward** path; the
+     envelope recipient was rewritten, so the true recipient survives in the
+     `Delivered-To` / `X-Forwarded-To` / `X-Original-To` headers.
+   - `cortana.h+<code>@agentmail.to` — the **direct-to-AgentMail** path (Mercury
+     sends straight to the lane-2 inbox and the `To` header survives intact). This
+     base is **derived from `CC_LANE2_INBOX`** (local part + domain), not hardcoded,
+     so there is no second env var. The match is **boundary-anchored** in the same
+     posture as the DKIM check, so a look-alike (`notcortana.h+<code>@agentmail.to`,
+     `cortana.h.evil+<code>@agentmail.to`, `...@agentmail.to.evil.com`) can't slip
+     through. On this direct path the surviving `dkim=pass` is Mercury's own
+     `d=mg.mercury.com` — already accepted since PR #8, so no DKIM change is needed.
 2. **Subject** matches `"<payor> sent you $X"`. A `Re:`/`Fwd:` prefix disqualifies
    it — an auto-forwarded Mercury notification keeps its original subject, so those
    prefixes mark a human reply or manual forward, not the payment itself.
@@ -96,8 +106,9 @@ and Rony's Approve/Reject taps route back into this same session. Non-qualifying
 mail to lane 2 is **ignored and logged** (no reply, no dispatch).
 
 **Near-miss ping.** A non-qualifying email that is still *payment-shaped* — the
-subject parsed as `"<payor> sent you $X"` **or** a recipient/header matched
-`finance+<code>@staygoldenhi.com` — is a likely real payment that tripped a single
+subject parsed as `"<payor> sent you $X"` **or** a recipient/header matched an
+accepted plus-address (`finance+<code>@staygoldenhi.com` **or** the direct-send
+`cortana.h+<code>@agentmail.to`) — is a likely real payment that tripped a single
 gate layer (e.g. DKIM showing an unrecognized origin domain on auto-forwarded
 mail). Rather than let it die in the log, the lane posts a terse
 `tg-send` ping (subject + the decision's `reasons`) to the **`cortana`** topic

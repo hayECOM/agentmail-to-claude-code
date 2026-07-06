@@ -41,6 +41,63 @@ def test_extract_code_none_for_plain_finance():
     assert pl.extract_finance_code(["finance@staygoldenhi.com"], None) is None
 
 
+# --- lane-2 direct-send recipient shape (derived from CC_LANE2_INBOX) ---------
+# Mercury sends straight to the AgentMail inbox as cortana.h+<code>@agentmail.to
+# (plus-addressing delivery verified live 2026-07-05, To header survives intact).
+# The accepted base is derived from CC_LANE2_INBOX, mirrored in pl.LANE2_INBOX.
+
+_LANE2_INBOX = "cortana.h@agentmail.to"
+
+
+def test_extract_code_from_lane2_plus_address_direct_send(monkeypatch):
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+    assert pl.extract_finance_code(["cortana.h+po1183@agentmail.to"], None) == "po1183"
+
+
+def test_extract_code_lane2_case_insensitive_and_display_name(monkeypatch):
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+    to = ["Cortana <Cortana.H+ABC-9@AgentMail.to>"]
+    assert pl.extract_finance_code(to, None) == "ABC-9"
+
+
+def test_extract_code_lane2_from_to_header_direct_send(monkeypatch):
+    # Direct send: envelope To survives intact, no Delivered-To rewrite involved.
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+    headers = {"To": "cortana.h+wire42@agentmail.to"}
+    assert pl.extract_finance_code(["cortana.h@agentmail.to"], headers) == "wire42"
+
+
+def test_extract_code_lane2_bare_inbox_is_not_a_code(monkeypatch):
+    # The plain inbox (no +<code>) is not a qualifying finance recipient.
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+    assert pl.extract_finance_code(["cortana.h@agentmail.to"], None) is None
+
+
+def test_extract_code_lane2_lookalikes_rejected(monkeypatch):
+    # Boundary-anchored per the PR-8 posture: a bare substring must not wave through
+    # an address that only LOOKS like the accepted plus-address.
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+    for bad in (
+        "cortana.h.evil+cle@agentmail.to",       # extra label between local part and '+'
+        "notcortana.h+cle@agentmail.to",         # prefix glued onto the local part
+        "cortana.h+cle@agentmail.to.evil.com",   # domain-suffix look-alike
+        "cortana.h+cle@evilagentmail.to",        # registrable look-alike domain
+    ):
+        assert pl.extract_finance_code([bad], None) is None, f"{bad} must not match"
+
+
+def test_extract_code_lane2_disabled_when_inbox_unset(monkeypatch):
+    # No CC_LANE2_INBOX -> the derived shape is off; only finance+ qualifies.
+    monkeypatch.setattr(pl, "LANE2_INBOX", "")
+    assert pl.extract_finance_code(["cortana.h+po7@agentmail.to"], None) is None
+
+
+def test_finance_alias_still_qualifies_when_lane2_enabled(monkeypatch):
+    # The two shapes coexist: enabling the lane-2 base doesn't drop the SG alias.
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+    assert pl.extract_finance_code(["finance+po1183@staygoldenhi.com"], None) == "po1183"
+
+
 # --- subject gate ------------------------------------------------------------
 
 def test_subject_parse_basic():
@@ -148,6 +205,30 @@ def test_evaluate_qualifies_with_forwarded_mercury_origin_dkim():
     assert d.qualified is True
     assert d.dkim.verdict == "pass" and d.dkim.strength == "strong"
     assert "mg.mercury.com" in d.dkim.detail
+
+
+def test_evaluate_qualifies_lane2_direct_send_with_mercury_dkim(monkeypatch):
+    # Direct-to-AgentMail send (2026-07-05): Mercury delivers straight to the inbox
+    # as cortana.h+<code>@agentmail.to (To header intact, no Gmail auto-forward), and
+    # DKIM is Mercury's own d=mg.mercury.com — accepted since PR #8. All three pass.
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+    ar = {"Authentication-Results":
+          "mx.agentmail.to; dkim=pass header.i=@mg.mercury.com header.s=pic; spf=pass"}
+    d = pl.evaluate(["cortana.h+po7@agentmail.to"], ar,
+                    "Golden Hour Studios Inc. sent you $38,548.70", [], "message.received")
+    assert d.qualified is True
+    assert d.code == "po7" and d.case_ref == "MERC-po7"
+    assert d.dkim.verdict == "pass" and d.dkim.strength == "strong"
+
+
+def test_evaluate_rejects_lane2_lookalike_recipient(monkeypatch):
+    # A look-alike direct-send recipient fails the recipient gate -> no qualify.
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+    ar = {"Authentication-Results":
+          "mx.agentmail.to; dkim=pass header.i=@mg.mercury.com header.s=pic"}
+    d = pl.evaluate(["notcortana.h+po7@agentmail.to"], ar,
+                    "Acme sent you $10", [], "message.received")
+    assert d.qualified is False and d.code is None
 
 
 def test_evaluate_rejects_bad_recipient():
@@ -266,6 +347,37 @@ def test_ping_on_near_miss_recipient_match_bad_subject(monkeypatch):
     argv = argv_log.read_text()
     assert "cortana" in argv
     assert 'subject does not match' in argv          # decision.reasons surfaced
+
+
+def test_ping_on_near_miss_lane2_recipient_bad_subject(monkeypatch):
+    fake, argv_log = _fake_tg_send("pl-ping-lane2-")
+    monkeypatch.setattr(pl, "TG_SEND", str(fake))
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+
+    # Direct-send recipient matches (cortana.h+<code>) but the subject didn't parse:
+    # payment-shaped near-miss, recognized by the new plus-address shape.
+    d = pl.evaluate(["cortana.h+po7@agentmail.to"], _GOOD_AR,
+                    "Payment notification", [], "message.received")
+    assert d.qualified is False
+    assert pl.is_payment_shaped(d) is True
+    assert pl.ping_near_miss(d, "Payment notification") is True
+    argv = argv_log.read_text()
+    assert "cortana" in argv
+    assert "stay_golden" not in argv
+
+
+def test_lane2_lookalike_recipient_is_not_payment_shaped(monkeypatch):
+    # A look-alike recipient with a non-payment subject matches NEITHER gate, so it's
+    # an unsolicited probe with no oracle -> silent, no near-miss ping.
+    fake, argv_log = _fake_tg_send("pl-lookalike-")
+    monkeypatch.setattr(pl, "TG_SEND", str(fake))
+    monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
+
+    d = pl.evaluate(["notcortana.h+po7@agentmail.to"], {}, "hello there",
+                    [], "message.received")
+    assert pl.is_payment_shaped(d) is False
+    assert pl.ping_near_miss(d, "hello there") is False
+    assert not argv_log.exists()
 
 
 def test_silent_on_spam_non_payment_shaped(monkeypatch):
