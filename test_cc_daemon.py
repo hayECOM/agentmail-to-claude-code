@@ -313,6 +313,22 @@ def test_cmux_open_session_returns_surface_id_when_ready(monkeypatch):
     assert daemon._cmux_open_session() == "SID"
 
 
+def test_cmux_open_session_pins_roland_identity_via_workspace_create(monkeypatch):
+    # Lane 1 must create its own workspace pinned to CC_LANE1_CWD and pass
+    # CLAUDE_LAUNCH_CWD so the launcher boots Roland regardless of what's focused;
+    # a bare surface.create would inherit the focused workspace's cwd/identity.
+    captured = {}
+    monkeypatch.setattr(daemon, "_cmux_rpc",
+                        lambda m, p=None: captured.update(method=m, params=p) or {"surface_id": "SID"})
+    monkeypatch.setattr(daemon, "_surface_text", lambda s: "... bypass permissions on ...")
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)
+    assert daemon._cmux_open_session() == "SID"
+    assert captured["method"] == "workspace.create"
+    assert captured["params"]["cwd"] == daemon.CC_LANE1_CWD
+    assert captured["params"]["command"] == "claude"
+    assert captured["params"]["workspace_env"]["CLAUDE_LAUNCH_CWD"] == daemon.CC_LANE1_CWD
+
+
 def test_cmux_open_session_raises_without_id(monkeypatch):
     monkeypatch.setattr(daemon, "_cmux_rpc", lambda m, p=None: {})
     with pytest.raises(RuntimeError):

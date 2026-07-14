@@ -95,11 +95,18 @@ CLAUDE_READY_TIMEOUT_S = int(os.environ.get("CC_READY_TIMEOUT", "120"))
 # send within a couple seconds of Claude becoming ready, not at the next coarse
 # tick -- the interval is "how often we peek," not "how long we wait."
 CLAUDE_READY_POLL_S = int(os.environ.get("CC_READY_POLL", "3"))
-# surface.create can fail with a transient "Broken pipe" when cmux's control
+# workspace.create can fail with a transient "Broken pipe" when cmux's control
 # plane is briefly unresponsive (mid-restart, recovering from a crash). Retry a
 # few times with backoff before giving up so a flaky cmux self-heals.
 SURFACE_CREATE_ATTEMPTS = int(os.environ.get("CC_SURFACE_CREATE_ATTEMPTS", "4"))
 SURFACE_CREATE_BACKOFF_S = int(os.environ.get("CC_SURFACE_CREATE_BACKOFF", "3"))
+# Lane-1 identity is cwd-pinned, not inherited. The launcher (claude-launcher.sh)
+# now respects the surface's starting cwd, so a bare surface.create would inherit
+# whatever workspace happens to be focused when the daemon fires -- and boot Claude
+# under that identity, not Roland. So lane 1 creates its OWN workspace pinned to
+# ~/Workspace and passes CLAUDE_LAUNCH_CWD to win the launcher's precedence
+# outright (explicit env > starting dir). Mirrors spawn-coder.sh's --cwd + --env.
+CC_LANE1_CWD = os.environ.get("CC_LANE1_CWD", str(pathlib.Path.home() / "Workspace"))
 
 # The AgentMail "received" websocket event can fire before the inbound message's
 # body has finished parsing -- notably for multipart mail carrying an inline
@@ -532,7 +539,9 @@ def _ghostty_send_pointer(handle: str, pointer_line: str) -> None:
 # Drives cmux via its Unix-socket control plane. Every call targets a specific
 # surface by surface_id (UUID), so concurrent emails never collide on a shared
 # frontmost-window focus. cmux runs Ghostty surfaces and honors
-# ~/.config/ghostty/config, so a new surface auto-launches Claude Code.
+# ~/.config/ghostty/config, so a new surface auto-launches Claude Code. Lane 1
+# opens via workspace.create (not surface.create) to pin Roland's cwd-identity
+# explicitly rather than trusting the launcher's ~/Workspace fallback.
 
 
 def _cmux_rpc(method: str, params: dict | None = None) -> dict:
@@ -558,10 +567,23 @@ def _surface_text(surface_id: str) -> str:
 
 
 def _cmux_open_session() -> str:
+    # workspace.create (not surface.create) so lane 1 pins its own identity: cwd +
+    # workspace_env=CLAUDE_LAUNCH_CWD both point at ~/Workspace, which wins the
+    # launcher's precedence and boots Roland regardless of what's focused. It
+    # returns a top-level surface_id, so the ready-wait + pointer-send below are
+    # unchanged. (Verified against cmux workspace.create: accepts cwd/command/name/
+    # workspace_env, returns surface_id.)
+    params = {
+        "cwd": CC_LANE1_CWD,
+        "command": "claude",
+        "name": "Roland: email task",
+        "workspace_env": {"CLAUDE_LAUNCH_CWD": CC_LANE1_CWD},
+        "focus": False,
+    }
     resp = None
     for attempt in range(1, SURFACE_CREATE_ATTEMPTS + 1):
         try:
-            resp = _cmux_rpc("surface.create")
+            resp = _cmux_rpc("workspace.create", params)
             break
         except subprocess.CalledProcessError as e:
             stderr = getattr(e, "stderr", "") or ""
@@ -570,13 +592,13 @@ def _cmux_open_session() -> str:
             if attempt == SURFACE_CREATE_ATTEMPTS:
                 raise
             log.warning(
-                "surface.create failed (attempt %d/%d), retrying in %ds: %s %s",
+                "workspace.create failed (attempt %d/%d), retrying in %ds: %s %s",
                 attempt, SURFACE_CREATE_ATTEMPTS, SURFACE_CREATE_BACKOFF_S, e, stderr,
             )
             time.sleep(SURFACE_CREATE_BACKOFF_S)
     surface_id = resp.get("surface_id")
     if not surface_id:
-        raise RuntimeError(f"surface.create returned no surface_id: {resp!r}")
+        raise RuntimeError(f"workspace.create returned no surface_id: {resp!r}")
     deadline = time.monotonic() + CLAUDE_READY_TIMEOUT_S
     while time.monotonic() < deadline:
         try:

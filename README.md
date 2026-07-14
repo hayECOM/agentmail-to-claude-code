@@ -31,9 +31,9 @@ Pick one with `CC_TERMINAL` in your env.
 3. Attachments are downloaded under `CC_HOME/attachments/<message-id>/`. Per-attachment failures log a warning and continue.
 4. A prompt is built from `From:`, `Subject:`, the body, and a footer listing every downloaded attachment by absolute path. It's written to `CC_HOME/prompts/<message-id>.md`.
 5. The selected backend opens a new Claude Code session and sends a single-line pointer telling Claude to read and act on the prompt file:
-   - **cmux:** `surface.create` (auto-launches Claude Code via the Ghostty config cmux reads) -> poll `surface.read_text` until ready -> `surface.send_text` the pointer -> `surface.send_key enter`. Every call targets a specific `surface_id`, so concurrent emails never collide.
+   - **cmux:** `workspace.create` with `cwd=~/Workspace` + `workspace_env` `CLAUDE_LAUNCH_CWD=~/Workspace` (pins Roland's identity so the session doesn't inherit whatever workspace is focused; auto-launches Claude Code via the Ghostty config cmux reads) -> poll `surface.read_text` until ready -> `surface.send_text` the pointer -> `surface.send_key enter`. Each call targets the returned `surface_id`, so concurrent emails never collide.
    - **ghostty:** `osascript` activates Ghostty and opens a new tab (Ghostty auto-launches Claude Code in new tabs), then pastes the pointer via the clipboard and presses Return.
-6. On a successful dispatch the message is marked read via the AgentMail REST API. If the dispatch fails (terminal unreachable), the message is left **unread** and a reply is bounced back to the sender so the task is never silently lost. `surface.create` is retried with backoff to ride out a briefly unresponsive cmux.
+6. On a successful dispatch the message is marked read via the AgentMail REST API. If the dispatch fails (terminal unreachable), the message is left **unread** and a reply is bounced back to the sender so the task is never silently lost. `workspace.create` is retried with backoff to ride out a briefly unresponsive cmux.
 
 The email is referenced by file path rather than typed inline, which keeps multi-line bodies intact across both backends. Image attachments are read by Claude with the Read tool from the paths in the prompt file.
 
@@ -181,6 +181,15 @@ The daemon needs your terminal to start Claude Code automatically when a new ses
 # either. Without this line `claude` is "command not found", Claude never starts,
 # and the daemon's readiness wait times out. Prepend the bins so it resolves.
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+# cwd sets Claude's identity (which CLAUDE.md loads), by precedence:
+#   1. explicit CLAUDE_LAUNCH_CWD wins (the daemon / spawn-coder pin a repo here);
+#   2. else if the surface opened in a real dir (a cmux workspace cwd), stay there;
+#   3. else ($HOME or /) fall back to ~/Workspace.
+if [[ -n "$CLAUDE_LAUNCH_CWD" ]]; then
+  cd "$CLAUDE_LAUNCH_CWD"
+elif [[ "$PWD" == "$HOME" || "$PWD" == "/" ]]; then
+  cd "$HOME/Workspace"
+fi
 caffeinate -dimsu -- claude --dangerously-skip-permissions
 echo "Claude exited. Type 'claude' to relaunch or 'exit' to close."
 exec /bin/zsh -li
