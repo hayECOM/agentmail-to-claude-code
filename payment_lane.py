@@ -429,6 +429,8 @@ def spawn_cortana(decision: Decision, prompt_text: str) -> str | None:
         "--repo", CORTANA_REPO,
         "--brief", brief,
         "--title", f"Cortana: mercury {ref}",
+        # spawn-coder defaults to the Roland group; these are Cortana sessions
+        "--group", "Cortana",
     ]
     log.info("LANE2 spawning cortana: %s", " ".join(shlex.quote(c) for c in cmd))
     try:

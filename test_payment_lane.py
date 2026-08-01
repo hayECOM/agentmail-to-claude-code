@@ -414,6 +414,7 @@ def test_spawn_cortana_invokes_spawn_coder_and_returns_handle(monkeypatch):
     argv = argv_log.read_text()
     assert "--repo /Users/hayecom/Cortana" in argv
     assert "--title Cortana: mercury MERC-po7" in argv
+    assert "--group Cortana" in argv
     # the brief points at the written prompt file
     prompt_file = tmp / "prompts" / "MERC-po7.md"
     assert prompt_file.exists()
