@@ -432,9 +432,20 @@ def spawn_cortana(decision: Decision, prompt_text: str) -> str | None:
         # spawn-coder defaults to the Roland group; these are Cortana sessions
         "--group", "Cortana",
     ]
+    # THIS LANE STAYS ON THE PERSONAL SEAT. Since 2026-08-19 `spawn-coder.sh` spawns
+    # sessions on the Stay Golden team profile by default, which is right for a coder a
+    # human dispatched and watches — and wrong here twice over: this is a CORTANA session,
+    # and it fires from the always-on com.agentmail.cc daemon with nobody looking. An
+    # expired team login would boot it into a sign-in prompt, the ready poll would fail,
+    # and the handle spawn-coder still echoes on that path would let the caller below mark
+    # a MERCURY PAYMENT email read. Passed as $SC_SEAT rather than `--seat personal` so an
+    # older spawn-coder (which would reject the unknown flag and kill the spawn outright)
+    # simply ignores it.
+    env = {**os.environ, "SC_SEAT": "personal"}
     log.info("LANE2 spawning cortana: %s", " ".join(shlex.quote(c) for c in cmd))
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=SPAWN_TIMEOUT_S)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=SPAWN_TIMEOUT_S, env=env)
     except Exception as e:
         log.error("LANE2 spawn-coder invocation failed: %s", e)
         return None

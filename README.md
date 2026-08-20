@@ -105,6 +105,15 @@ via the [telegram-gateway](../telegram-gateway) `tg-send --case-ref MERC-<code>`
 and Rony's Approve/Reject taps route back into this same session. Non-qualifying
 mail to lane 2 is **ignored and logged** (no reply, no dispatch).
 
+The spawn is pinned to the **personal Claude seat** (`SC_SEAT=personal` in the
+subprocess env). Since 2026-08-19 `spawn-coder.sh` defaults to the Stay Golden team
+profile, which suits a coder a human dispatched and watches — and not this lane, which
+fires from the always-on `com.agentmail.cc` daemon with nobody looking. An expired team
+login would boot the session into a sign-in prompt, the ready poll would fail, and the
+handle `spawn-coder` still echoes on that path would let the handle scan below mark a
+**Mercury payment email read**. Threaded by env rather than `--seat` so an older
+`spawn-coder` ignores it instead of dying on an unknown flag.
+
 **Near-miss ping.** A non-qualifying email that is still *payment-shaped* — the
 subject parsed as `"<payor> sent you $X"` **or** a recipient/header matched an
 accepted plus-address (`finance+<code>@staygoldenhi.com` **or** the direct-send

@@ -395,10 +395,12 @@ def test_silent_on_spam_non_payment_shaped(monkeypatch):
 def test_spawn_cortana_invokes_spawn_coder_and_returns_handle(monkeypatch):
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="pl-spawn-"))
     argv_log = tmp / "argv.log"
+    env_log = tmp / "env.log"
     fake = tmp / "fake-spawn-coder.sh"
     fake.write_text(
         "#!/usr/bin/env bash\n"
         f'echo "$*" >> "{argv_log}"\n'
+        f'echo "SC_SEAT=${{SC_SEAT:-<unset>}}" >> "{env_log}"\n'
         'echo "workspace:42"\n'
     )
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -420,3 +422,12 @@ def test_spawn_cortana_invokes_spawn_coder_and_returns_handle(monkeypatch):
     assert prompt_file.exists()
     assert "the brief body" in prompt_file.read_text()
     assert str(prompt_file) in argv
+
+    # THE SEAT. spawn-coder defaults coders to the SG team profile; this lane must stay
+    # on the personal login. It fires from the always-on com.agentmail.cc daemon with
+    # nobody watching, and a Mercury payment rides on it: an expired team login would
+    # boot the session into a sign-in prompt, the ready poll would fail, and the handle
+    # spawn-coder still echoes would let the daemon mark the payment email READ. Threaded
+    # by environment, not --seat, so an older spawn-coder ignores it instead of dying on
+    # an unknown flag.
+    assert env_log.read_text().strip() == "SC_SEAT=personal"
