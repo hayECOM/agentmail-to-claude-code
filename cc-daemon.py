@@ -774,7 +774,8 @@ def _fetch_raw_message(client: AgentMail, inbox: str, message_id: str) -> bytes:
 
     Lane 2's DKIM raw fallback (payment_lane.dkim_check): AgentMail's parsed
     headers can omit Authentication-Results / DKIM-Signature that the .eml still
-    carries. Raises on any failure; dkim_check turns that into unknown(unavailable).
+    carries. Raises on any failure; dkim_check retries once, then fails closed
+    (fail(fetch-failed) -> near-miss ping).
     """
     raw = client.inboxes.messages.get_raw(inbox_id=inbox, message_id=message_id)
     url = getattr(raw, "download_url", None)
@@ -818,15 +819,6 @@ def handle_payment_lane(client: AgentMail, ev) -> None:
             decision.dkim.strength, decision.dkim.source, "; ".join(decision.reasons),
         )
         return
-
-    # Prominent surfacing of the fallback path so the first real payment reveals
-    # whether AgentMail exposes auth headers (plan §Email authentication).
-    if decision.dkim.verdict == "unknown":
-        log.warning(
-            "LANE2 DKIM-HEADERS-UNAVAILABLE — qualified on recipient+subject+"
-            "AgentMail-authenticated only. VERIFY AgentMail header exposure. detail=%s",
-            decision.dkim.detail,
-        )
 
     log.info(
         "LANE2 QUALIFIED case=%s code=%s payor=%r amount=%s dkim=%s(%s) dkim_via=%s",

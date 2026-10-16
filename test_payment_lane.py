@@ -12,7 +12,14 @@ import pathlib
 import stat
 import tempfile
 
+import pytest
+
 import payment_lane as pl
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_pause(monkeypatch):
+    monkeypatch.setattr(pl, "RAW_FETCH_RETRY_DELAY_S", 0)
 
 
 # --- recipient gate ----------------------------------------------------------
@@ -211,9 +218,10 @@ def test_evaluate_qualifies_lane2_direct_send_with_mercury_dkim(monkeypatch):
     # Direct-to-AgentMail send (2026-07-05): Mercury delivers straight to the inbox
     # as cortana.h+<code>@agentmail.to (To header intact, no Gmail auto-forward), and
     # DKIM is Mercury's own d=mg.mercury.com — accepted since PR #8. All three pass.
+    # The receiver stamp on a direct send is AgentMail's SES (amazonses.com).
     monkeypatch.setattr(pl, "LANE2_INBOX", _LANE2_INBOX)
     ar = {"Authentication-Results":
-          "mx.agentmail.to; dkim=pass header.i=@mg.mercury.com header.s=pic; spf=pass"}
+          "amazonses.com; dkim=pass header.i=@mg.mercury.com header.s=pic; spf=pass"}
     d = pl.evaluate(["cortana.h+po7@agentmail.to"], ar,
                     "Golden Hour Studios Inc. sent you $38,548.70", [], "message.received")
     assert d.qualified is True
@@ -250,11 +258,14 @@ def test_evaluate_rejects_dkim_fail_even_if_recipient_subject_ok():
     assert d.qualified is False
 
 
-def test_evaluate_unknown_dkim_but_authed_qualifies_on_the_rest():
+def test_evaluate_unknown_dkim_never_qualifies_on_the_authed_bit():
+    # Review r2 X3: the retired fail-open. No auth headers anywhere + AgentMail's
+    # generic authed bit is NOT a qualify; it is a payment-shaped near-miss.
     d = pl.evaluate(["finance+po7@staygoldenhi.com"], {},
                     "Acme sent you $10", [], "message.received")
-    assert d.qualified is True
-    assert any("DKIM headers unavailable" in r for r in d.reasons)
+    assert d.dkim.verdict == "unknown" and d.dkim.authed is True
+    assert d.qualified is False and pl.is_payment_shaped(d)
+    assert any("DKIM unverifiable" in r for r in d.reasons)
 
 
 def test_evaluate_unknown_dkim_and_unauthenticated_is_rejected():
@@ -493,16 +504,21 @@ def test_build_prompt_names_the_dkim_path():
     assert "via raw-fallback" in p
 
 
-def test_dkim_raw_fallback_fetch_failure_stays_unknown():
-    # (b) raw fetch fails -> unknown(unavailable), never fabricated.
+def test_dkim_raw_fallback_fetch_failure_fails_closed():
+    # Review r2 X3: a fetch that fails twice (raise or empty) is a FAIL, never a
+    # fall-back onto AgentMail's authed bit.
+    calls = []
+
     def boom():
-        raise RuntimeError("cdn 503")
+        calls.append(1)
+        raise TimeoutError("cdn read timed out")
     r = pl.dkim_check(_BLIND_PARSED_PET, [], "message.received", raw_fetch=boom)
-    assert r.verdict == "unknown" and r.strength == "unavailable"
-    assert r.source == "parsed" and "raw-fallback fetch failed" in r.detail
+    assert len(calls) == 2  # retried once
+    assert r.verdict == "fail" and r.strength == "fetch-failed"
+    assert "fetch failed twice" in r.detail and "TimeoutError" in r.detail
     for empty in (None, b"", ""):
         r = pl.dkim_check(_BLIND_PARSED_PET, [], "message.received", raw_fetch=lambda e=empty: e)
-        assert r.verdict == "unknown" and r.strength == "unavailable"
+        assert r.verdict == "fail" and r.strength == "fetch-failed", empty
 
 
 def test_dkim_raw_fallback_raw_without_auth_headers_is_fail():
@@ -638,3 +654,134 @@ def test_authserv_id_parsing():
     assert pl._authserv_id("  MX.Google.com 1; dkim=pass") == "mx.google.com"
     assert pl._authserv_id("amazonses.com.evil.example; dkim=pass") == "amazonses.com.evil.example"
     assert pl._authserv_id("") == ""
+
+
+# --- review r2 X1: parse the authenticated domain, never substring-match --------
+
+_LANE2_SUBJ = "Golden Hour Studios Inc. sent you $40,099.92"
+
+
+def test_auid_local_part_naming_mercury_does_not_qualify():
+    # An attacker signs legitimately for attacker.example with i=mercury.com@...;
+    # the receiver's honest AR says pass, but the signing domain is attacker.example.
+    for ar in ("amazonses.com; dkim=pass header.i=mercury.com@attacker.example header.s=s1",
+               "mx.google.com; dkim=pass header.i=mg.mercury.com@attacker.example"):
+        r = pl.dkim_check({"Authentication-Results": ar}, [], "message.received")
+        assert r.verdict == "fail", ar
+        d = pl.evaluate(["finance+cle@staygoldenhi.com"], {"Authentication-Results": ar},
+                        _LANE2_SUBJ, [], "message.received")
+        assert d.qualified is False, ar
+        raw = _raw(f"Authentication-Results: {ar}\r\n".encode())
+        d = pl.evaluate([], _BLIND_PARSED_CLE, _LANE2_SUBJ, [], "message.received",
+                        raw_fetch=lambda raw=raw: raw)
+        assert d.dkim.source == "raw-fallback" and d.qualified is False, ar
+
+
+def test_dkim_pass_smuggled_in_a_comment_does_not_qualify():
+    for ar in ("amazonses.com; dkim=fail (dkim=pass header.i=@mg.mercury.com)",
+               "amazonses.com; dkim=fail (nested (dkim=pass) header.i=@mg.mercury.com) "
+               "header.i=@mg.mercury.com",
+               "amazonses.com; dkim=pass (header.i=@mg.mercury.com) header.i=@attacker.example"):
+        r = pl.dkim_check({"Authentication-Results": ar}, [], "message.received")
+        assert r.verdict == "fail", ar
+        raw = _raw(f"Authentication-Results: {ar}\r\n".encode())
+        d = pl.evaluate([], _BLIND_PARSED_CLE, _LANE2_SUBJ, [], "message.received",
+                        raw_fetch=lambda raw=raw: raw)
+        assert d.qualified is False, ar
+
+
+def test_dkim_pass_only_counts_as_the_clause_methodspec():
+    # A quoted property value can't carry the domain or the pass token.
+    for ar in ('amazonses.com; dkim=pass smtp.mailfrom="a header.i=@mg.mercury.com"',
+               'amazonses.com; spf=pass smtp.mailfrom="x; dkim=pass header.i=@mg.mercury.com"',
+               "amazonses.com; spf=pass dkim=pass header.i=@mg.mercury.com"):
+        r = pl.dkim_check({"Authentication-Results": ar}, [], "message.received")
+        assert r.verdict == "fail", ar
+
+
+def test_header_d_is_the_signing_domain_and_wins_over_header_i():
+    ok = "amazonses.com; dkim=pass header.d=mg.mercury.com header.s=pic"
+    assert pl.dkim_check({"Authentication-Results": ok}, [], "message.received").verdict == "pass"
+    bad = "amazonses.com; dkim=pass header.d=attacker.example header.i=@mg.mercury.com"
+    assert pl.dkim_check({"Authentication-Results": bad}, [], "message.received").verdict == "fail"
+
+
+def test_real_and_historical_ar_shapes_still_pass_strong():
+    for raw in (_RAW_PET, _RAW_CLE):
+        r = pl.dkim_check(_BLIND_PARSED_PET, [], "message.received", raw_fetch=lambda raw=raw: raw)
+        assert (r.verdict, r.strength) == ("pass", "strong")
+        assert r.detail.endswith("dkim=pass mg.mercury.com")
+    for ar in ("mx.google.com; dkim=pass header.i=@staygoldenhi.com",
+               "mx.google.com; dkim=pass header.i=@mg.mercury.com header.s=pic header.b=AbC; "
+               "spf=pass (google.com: domain of x@mg.mercury.com designates 1.2.3.4) "
+               'smtp.mailfrom="bounce+x-finance+cle=staygoldenhi.com@mg.mercury.com"'):
+        r = pl.dkim_check({"Authentication-Results": ar}, [], "message.received")
+        assert (r.verdict, r.strength) == ("pass", "strong"), ar
+
+
+# --- review r2 X2: parsed-path provenance parity ---------------------------------
+
+_SES_FAIL_RAW = _raw(b"Authentication-Results: amazonses.com; spf=pass; dkim=fail "
+                     b"header.i=@mg.mercury.com\r\n")
+
+
+def test_parsed_sender_arc_ar_is_ignored_and_raw_decides():
+    calls = []
+
+    def fetch(raw):
+        calls.append(1)
+        return raw
+    parsed = {**_BLIND_PARSED_CLE, "ARC-Authentication-Results":
+              "i=1; mx.google.com; dkim=pass header.i=@mg.mercury.com"}
+    r = pl.dkim_check(parsed, [], "message.received", raw_fetch=lambda: fetch(_SES_FAIL_RAW))
+    assert calls and r.source == "raw-fallback" and r.verdict == "fail"
+    d = pl.evaluate([], parsed, _SUBJ, [], "message.received",
+                    raw_fetch=lambda: _SES_FAIL_RAW)
+    assert d.qualified is False and pl.is_payment_shaped(d)
+    # and when the raw message is genuine, raw's pass is what decides
+    r = pl.dkim_check(parsed, [], "message.received", raw_fetch=lambda: _RAW_CLE)
+    assert (r.verdict, r.source) == ("pass", "raw-fallback")
+
+
+def test_parsed_ar_from_untrusted_authserv_falls_through_to_raw():
+    parsed = {**_BLIND_PARSED_CLE, "Authentication-Results":
+              "evil.example; dkim=pass header.i=@mg.mercury.com"}
+    r = pl.dkim_check(parsed, [], "message.received", raw_fetch=lambda: _SES_FAIL_RAW)
+    assert r.source == "raw-fallback" and r.verdict == "fail"
+
+
+def test_parsed_fabricated_sig_plus_authed_never_preempts_raw():
+    parsed = {**_BLIND_PARSED_CLE,
+              "DKIM-Signature": "v=1; a=rsa-sha256; d=mg.mercury.com; s=pic; b=forged"}
+    d = pl.evaluate([], parsed, _SUBJ, [], "message.received", raw_fetch=lambda: _SES_FAIL_RAW)
+    assert d.dkim.authed is True
+    assert d.dkim.source == "raw-fallback" and d.dkim.verdict == "fail"
+    assert d.qualified is False
+
+
+# --- review r2 X3: fail closed when the raw fetch fails ---------------------------
+
+def test_fetch_failing_twice_is_not_qualified_and_pings_near_miss(monkeypatch):
+    fake, argv_log = _fake_tg_send("pl-ping-fetch-")
+    monkeypatch.setattr(pl, "TG_SEND", str(fake))
+
+    def boom():
+        raise TimeoutError("timed out")
+    d = pl.evaluate([], _BLIND_PARSED_CLE, _SUBJ, [], "message.received", raw_fetch=boom)
+    assert d.qualified is False and d.dkim.strength == "fetch-failed"
+    assert pl.ping_near_miss(d, _SUBJ) is True
+    assert "raw-fallback fetch failed twice" in argv_log.read_text()
+
+
+def test_transient_fetch_failure_then_success_takes_the_raw_verdict():
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("cdn 503")
+        return _RAW_CLE
+    d = pl.evaluate([], _BLIND_PARSED_CLE, _SUBJ, [], "message.received", raw_fetch=flaky)
+    assert len(attempts) == 2
+    assert d.qualified is True
+    assert (d.dkim.verdict, d.dkim.strength, d.dkim.source) == ("pass", "strong", "raw-fallback")
