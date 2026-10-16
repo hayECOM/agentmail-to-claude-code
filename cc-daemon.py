@@ -769,6 +769,22 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
         log.warning("mark-read skipped: %s", e)
 
 
+def _fetch_raw_message(client: AgentMail, inbox: str, message_id: str) -> bytes:
+    """The raw RFC-822 .eml for a message: GET /messages/<id>/raw -> download_url.
+
+    Lane 2's DKIM raw fallback (payment_lane.dkim_check): AgentMail's parsed
+    headers can omit Authentication-Results / DKIM-Signature that the .eml still
+    carries. Raises on any failure; dkim_check turns that into unknown(unavailable).
+    """
+    raw = client.inboxes.messages.get_raw(inbox_id=inbox, message_id=message_id)
+    url = getattr(raw, "download_url", None)
+    if not url:
+        raise RuntimeError("get_raw returned no download_url")
+    resp = httpx.get(url, timeout=30, follow_redirects=True)
+    resp.raise_for_status()
+    return resp.content
+
+
 def handle_payment_lane(client: AgentMail, ev) -> None:
     """Lane 2: qualify a cortana.h payment email and spawn a Cortana session.
 
@@ -785,7 +801,10 @@ def handle_payment_lane(client: AgentMail, ev) -> None:
     recipients = list(getattr(msg, "to", None) or [])
     headers = dict(getattr(msg, "headers", None) or {})
 
-    decision = payment_lane.evaluate(recipients, headers, subject, labels, event_type)
+    decision = payment_lane.evaluate(
+        recipients, headers, subject, labels, event_type,
+        raw_fetch=lambda: _fetch_raw_message(client, LANE2_INBOX, msg.message_id),
+    )
     if not decision.qualified:
         # A payment-SHAPED near-miss (a real payment that tripped one gate layer,
         # e.g. DKIM showing mercury.com on auto-forwarded mail) would otherwise die
@@ -793,8 +812,10 @@ def handle_payment_lane(client: AgentMail, ev) -> None:
         # spam (neither recipient nor subject matches) stays silent.
         pinged = payment_lane.ping_near_miss(decision, subject)
         log.info(
-            "LANE2 IGNORE non-qualifying inbox=%s from=%s subj=%r near_miss_ping=%s reasons=%s",
-            LANE2_INBOX, sender, subject, pinged, "; ".join(decision.reasons),
+            "LANE2 IGNORE non-qualifying inbox=%s from=%s subj=%r near_miss_ping=%s "
+            "dkim=%s(%s) dkim_via=%s reasons=%s",
+            LANE2_INBOX, sender, subject, pinged, decision.dkim.verdict,
+            decision.dkim.strength, decision.dkim.source, "; ".join(decision.reasons),
         )
         return
 
@@ -808,9 +829,9 @@ def handle_payment_lane(client: AgentMail, ev) -> None:
         )
 
     log.info(
-        "LANE2 QUALIFIED case=%s code=%s payor=%r amount=%s dkim=%s(%s)",
+        "LANE2 QUALIFIED case=%s code=%s payor=%r amount=%s dkim=%s(%s) dkim_via=%s",
         decision.case_ref, decision.code, decision.payor, decision.amount,
-        decision.dkim.verdict, decision.dkim.strength,
+        decision.dkim.verdict, decision.dkim.strength, decision.dkim.source,
     )
 
     prompt = payment_lane.build_cortana_prompt(

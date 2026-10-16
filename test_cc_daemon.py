@@ -658,3 +658,49 @@ def test_handle_primitive_failure_no_reply_when_disabled(monkeypatch):
     daemon.handle_primitive_email(_primitive_detail(), state)
     assert replies == []  # no outbound mail when replies disabled
     assert state["processed"] == ["em_primitive"]  # still marked handled
+
+
+# --- lane 2: DKIM raw-message fallback --------------------------------------
+
+def _raw_client(download_url, calls):
+    class _Raw:
+        def __init__(self, url):
+            self.download_url = url
+
+    class _Messages:
+        def get_raw(self, **kw):
+            calls.append(kw)
+            return _Raw(download_url)
+
+    class _Inboxes:
+        messages = _Messages()
+
+    class _Client:
+        inboxes = _Inboxes()
+
+    return _Client()
+
+
+def test_fetch_raw_message_downloads_the_eml(monkeypatch):
+    calls, got = [], {}
+
+    class _Resp:
+        content = b"Authentication-Results: amazonses.com; dkim=pass\r\n\r\n"
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, **kw):
+        got["url"] = url
+        return _Resp()
+
+    monkeypatch.setattr(daemon.httpx, "get", fake_get)
+    out = daemon._fetch_raw_message(_raw_client("https://cdn/x.eml", calls), "cort@x", "<m@x>")
+    assert out.startswith(b"Authentication-Results")
+    assert calls == [{"inbox_id": "cort@x", "message_id": "<m@x>"}]
+    assert got["url"] == "https://cdn/x.eml"
+
+
+def test_fetch_raw_message_raises_without_download_url():
+    with pytest.raises(RuntimeError):
+        daemon._fetch_raw_message(_raw_client(None, []), "cort@x", "<m@x>")

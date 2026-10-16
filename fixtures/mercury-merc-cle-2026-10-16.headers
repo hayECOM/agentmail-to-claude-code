@@ -1,0 +1,17 @@
+Received: from mail-ej1-f49.google.com (mail-ej1-f49.google.com [209.85.218.49]) by inbound-smtp.us-east-1.amazonaws.com with SMTP id t0l2k980o5dpkujo2061e20cuka8igju0p4tnp81 for cort@staygoldenhawaii.com; Fri, 16 Oct 2026 13:47:07 +0000 (UTC)
+Authentication-Results: amazonses.com; spf=pass (spfCheck: domain of staygoldenhi.com designates 209.85.218.49 as permitted sender) client-ip=209.85.218.49; envelope-from=rony+caf_=cort=staygoldenhawaii.com@staygoldenhi.com; helo=mail-ej1-f49.google.com; dkim=pass header.i=@mg.mercury.com; dmarc=pass header.from=mercury.com;
+Received: by mail-ej1-f49.google.com with SMTP id a640c23a62f3a-c40447e25e6so137858466b.1 for <cort@staygoldenhawaii.com>; Fri, 16 Oct 2026 06:47:06 -0700 (PDT)
+ARC-Authentication-Results: i=2; mx.google.com; dkim=pass header.i=@mg.mercury.com header.s=pic header.b=REDACTED; spf=pass (google.com: domain of bounce+6cd5bc.1ed9be-finance+cle=staygoldenhi.com@mg.mercury.com designates 69.72.44.127 as permitted sender) smtp.mailfrom="bounce+6cd5bc.1ed9be-finance+CLE=staygoldenhi.com@mg.mercury.com"; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=mercury.com
+Delivered-To: finance+cle@staygoldenhi.com
+Received: by 2002:a05:7412:b301:b0:20c:8e61:1d34 with SMTP id ds1csp3265122rdb; Fri, 16 Oct 2026 06:47:04 -0700 (PDT)
+ARC-Authentication-Results: i=1; mx.google.com; dkim=pass header.i=@mg.mercury.com header.s=pic header.b=REDACTED; spf=pass (google.com: domain of bounce+6cd5bc.1ed9be-finance+cle=staygoldenhi.com@mg.mercury.com designates 69.72.44.127 as permitted sender) smtp.mailfrom="bounce+6cd5bc.1ed9be-finance+CLE=staygoldenhi.com@mg.mercury.com"; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=mercury.com
+Received: from v5127.v5e5d4d68.usw1.send.mailgun.net (v5127.v5e5d4d68.usw1.send.mailgun.net. [69.72.44.127]) by mx.google.com with UTF8SMTPS id d2e1a72fcca58-8a000fbe8d6si1594034b3a.186.2026.10.16.06.47.02 for <finance+CLE@staygoldenhi.com> (version=TLS1_2 cipher=ECDHE-ECDSA-AES128-GCM-SHA256 bits=128/128); Fri, 16 Oct 2026 06:47:03 -0700 (PDT)
+Authentication-Results: mx.google.com; dkim=pass header.i=@mg.mercury.com header.s=pic header.b=REDACTED; spf=pass (google.com: domain of bounce+6cd5bc.1ed9be-finance+cle=staygoldenhi.com@mg.mercury.com designates 69.72.44.127 as permitted sender) smtp.mailfrom="bounce+6cd5bc.1ed9be-finance+CLE=staygoldenhi.com@mg.mercury.com"; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=mercury.com
+DKIM-Signature: a=rsa-sha256; v=1; c=relaxed/relaxed; d=mg.mercury.com; q=dns/txt; s=pic; t=1792158421; x=1792165621; h=Content-Type: MIME-Version: Reply-To: Subject: Subject: To: To: From: From: Message-Id: Date: Sender; bh=REDACTED; b=REDACTED
+Received: from ip-10-0-70-145.ec2.internal (ec2-52-21-187-151.compute-1.amazonaws.com [52.21.187.151]) by 02fd7c2afc36a9e462466cc7da1cd0b7dd7102787a02745452ed3c1f7a18fd76 with SMTP id 6ad22ad5fa6ef32f9d72e9cb; Fri, 16 Oct 2026 13:47:01 GMT
+Date: Fri, 16 Oct 2026 13:47:01 +0000
+Message-Id: <20261016134701.7d7c76f8dd268baf@mg.mercury.com>
+From: =?utf-8?Q?Mercury?= <hello@mercury.com>
+To: <finance+CLE@staygoldenhi.com>
+Subject: Golden Hour Studios Inc. sent you $17,185.68
+
