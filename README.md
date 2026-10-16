@@ -86,7 +86,13 @@ A lane-2 email qualifies only if **all three** hold:
    layered and **fail-closed**: (a) an `Authentication-Results` clause with
    `dkim=pass` + an accepted domain; else (b) a `DKIM-Signature` carrying
    `d=<accepted domain>`, trusted only if AgentMail also marked the message
-   authenticated; else (c) **unknown** — AgentMail exposed no auth headers, which is
+   authenticated; else, when AgentMail's *parsed* headers carry neither, the same
+   decision re-runs over the **raw .eml** (`GET /messages/<id>/raw` → `download_url`),
+   reading only the topmost `Authentication-Results` (the receiver's own stamp — lower
+   copies can be written by the sender) and the verdict says `dkim_via=raw-fallback`
+   in the daemon log and the Cortana brief (added 2026-10-16, when the parsed view
+   went blind on every message). The raw fetch runs only for payment-shaped mail. A
+   failed fetch stays (c) **unknown** — no auth headers anywhere, which is
    logged **prominently** (`LANE2 DKIM-HEADERS-UNAVAILABLE`) and the mail is gated on
    recipient + subject + AgentMail's own auth verdict (per the plan's fallback). A
    present-but-wrong DKIM domain is rejected. Accepted domains are `staygoldenhi.com`
@@ -124,6 +130,20 @@ mail). Rather than let it die in the log, the lane posts a terse
 (`CC_LANE2_NEAR_MISS_TOPIC`, *not* `stay_golden`) so near-misses surface for
 tuning. Mail matching neither gate is an unsolicited probe with no oracle, so it
 stays silent.
+
+**Next-tranche staging** (`stage_next_tranche.py`, Rony's go 2026-10-16). After the
+payment session commits a wire, it runs
+`stage_next_tranche.py --base prod --invoice <paid invoice rec>` once per invoice the
+wire paid in full. On two-part split terms (`30/70`) with no seq-2 invoice on the PO,
+it creates the balance invoice at `Estimate` — same PO and terms, amount forced by
+the ratio to the cent (`$17,185.68 × 70/30 = $40,099.92`), the paid tranche's PDF —
+and appends a dated line to the PO's `Notes`. Anything not forced by arithmetic
+(three-part terms, a ratio off whole cents, any other invoice on the PO that could
+move the split base) prints `TRANCHE FLAG …` and exits 3 for the session to
+escalate; a seq-2 sibling in any status is a `NOOP`. It's a helper the session
+calls, not daemon post-processing, so the session stays the only prod writer.
+Stdlib-only; PAT + base ids from `~/Workspace/tools/po-payment-flow/.env`;
+`--dry-run` writes nothing.
 
 Because this lane spawns Cortana (who reads the vault) and never deploys, it
 replaces the archived `sg-finance-agent` whose sin was being deployed — cut off

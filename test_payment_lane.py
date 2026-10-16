@@ -431,3 +431,126 @@ def test_spawn_cortana_invokes_spawn_coder_and_returns_handle(monkeypatch):
     # by environment, not --seat, so an older spawn-coder ignores it instead of dying on
     # an unknown flag.
     assert env_log.read_text().strip() == "SC_SEAT=personal"
+
+
+# --- DKIM raw-message fallback (2026-10-16) ----------------------------------
+# MERC-pet / MERC-cle that morning: AgentMail's PARSED headers carried neither
+# Authentication-Results nor DKIM-Signature (only ARC-Seal, X-Google-DKIM-Signature,
+# X-Forwarded-To, ...), so the gate went blind -> unknown(unavailable). The raw .eml
+# carried SES's Authentication-Results (topmost) + Google's, all dkim=pass
+# header.i=@mg.mercury.com. Fixtures are those two raw header blocks, sanitized.
+
+_FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+_RAW_PET = (_FIXTURES / "mercury-merc-pet-2026-10-16.headers").read_bytes()
+_RAW_CLE = (_FIXTURES / "mercury-merc-cle-2026-10-16.headers").read_bytes()
+
+# The parsed-header view AgentMail exposed for both messages (keys verbatim; the
+# values that matter here are only the recipient-bearing ones).
+_BLIND_PARSED_PET = {
+    "ARC-Seal": "i=2; a=rsa-sha256; t=1792158076; cv=pass; d=google.com; s=arc-20260327",
+    "ARC-Message-Signature": "i=2; a=rsa-sha256; c=relaxed/relaxed; d=google.com",
+    "Delivered-To": "finance+pet@staygoldenhi.com",
+    "X-Forwarded-To": "cort@staygoldenhawaii.com",
+    "X-Forwarded-For": "finance@staygoldenhi.com cort@staygoldenhawaii.com",
+    "X-Google-DKIM-Signature": "v=1; a=rsa-sha256; c=relaxed/relaxed; d=1e100.net; s=20251104",
+    "X-Gm-Message-State": "AOJu0Yw...",
+    "X-Mailgun-Sid": "WyJ...",
+    "X-Received": "by 2002:a05:6402:...",
+}
+_BLIND_PARSED_CLE = {**_BLIND_PARSED_PET, "Delivered-To": "finance+cle@staygoldenhi.com"}
+
+
+def test_raw_auth_headers_takes_topmost_receiver_stamp():
+    h = pl.raw_auth_headers(_RAW_CLE)
+    assert h["Authentication-Results"].startswith("amazonses.com;")
+    assert "dkim=pass header.i=@mg.mercury.com" in h["Authentication-Results"]
+    assert h["ARC-Authentication-Results"].startswith("i=2;")
+    assert "d=mg.mercury.com" in h["DKIM-Signature"]
+
+
+def test_dkim_raw_fallback_passes_on_real_merc_pet_and_cle_shapes():
+    # (a) parsed headers blind + raw passes -> pass, tagged as the fallback path.
+    for parsed, raw in ((_BLIND_PARSED_PET, _RAW_PET), (_BLIND_PARSED_CLE, _RAW_CLE)):
+        r = pl.dkim_check(parsed, [], "message.received", raw_fetch=lambda raw=raw: raw)
+        assert r.verdict == "pass" and r.strength == "strong"
+        assert r.source == "raw-fallback"
+        assert r.detail.startswith("raw-fallback:") and "mg.mercury.com" in r.detail
+
+
+def test_evaluate_qualifies_merc_cle_via_raw_fallback():
+    d = pl.evaluate([], _BLIND_PARSED_CLE, "Golden Hour Studios Inc. sent you $17,185.68",
+                    [], "message.received", raw_fetch=lambda: _RAW_CLE)
+    assert d.qualified is True and d.code == "cle" and d.amount == "17185.68"
+    assert d.dkim.verdict == "pass" and d.dkim.source == "raw-fallback"
+    assert not d.reasons  # no "headers unavailable" downgrade any more
+
+
+def test_build_prompt_names_the_dkim_path():
+    d = pl.evaluate([], _BLIND_PARSED_CLE, "Golden Hour Studios Inc. sent you $17,185.68",
+                    [], "message.received", raw_fetch=lambda: _RAW_CLE)
+    p = pl.build_cortana_prompt(d, "hello@mercury.com", "s", "b", None, "cort@x")
+    assert "via raw-fallback" in p
+
+
+def test_dkim_raw_fallback_fetch_failure_stays_unknown():
+    # (b) raw fetch fails -> unknown(unavailable), never fabricated.
+    def boom():
+        raise RuntimeError("cdn 503")
+    r = pl.dkim_check(_BLIND_PARSED_PET, [], "message.received", raw_fetch=boom)
+    assert r.verdict == "unknown" and r.strength == "unavailable"
+    assert r.source == "parsed" and "raw-fallback fetch failed" in r.detail
+    for empty in (None, b"", ""):
+        r = pl.dkim_check(_BLIND_PARSED_PET, [], "message.received", raw_fetch=lambda e=empty: e)
+        assert r.verdict == "unknown" and r.strength == "unavailable"
+
+
+def test_dkim_raw_fallback_raw_without_auth_headers_stays_unknown():
+    raw = b"From: hello@mercury.com\r\nTo: finance+cle@staygoldenhi.com\r\nSubject: x\r\n\r\nbody"
+    r = pl.dkim_check({}, [], "message.received", raw_fetch=lambda: raw)
+    assert r.verdict == "unknown" and r.strength == "unavailable"
+    assert r.source == "raw-fallback"
+
+
+def test_dkim_raw_fallback_no_accepted_domain_is_fail():
+    # (c) raw present but no accepted domain -> fail.
+    raw = (b"Authentication-Results: amazonses.com; spf=pass; dkim=pass header.i=@evilmercury.com\r\n"
+           b"DKIM-Signature: v=1; a=rsa-sha256; d=evilmercury.com; s=pic\r\n"
+           b"From: hello@mercury.com\r\n\r\nbody")
+    r = pl.dkim_check(_BLIND_PARSED_CLE, [], "message.received", raw_fetch=lambda: raw)
+    assert r.verdict == "fail" and r.strength == "present-no-match"
+    assert r.source == "raw-fallback"
+    d = pl.evaluate([], _BLIND_PARSED_CLE, "Golden Hour Studios Inc. sent you $1.00",
+                    [], "message.received", raw_fetch=lambda: raw)
+    assert d.qualified is False
+
+
+def test_dkim_raw_fallback_ignores_forged_lower_authentication_results():
+    # A direct spoof can write its own Authentication-Results into the headers it
+    # sends. Only the topmost one (the receiver's stamp) counts: here SES says the
+    # signature failed, so the forged "pass" below it must not qualify.
+    raw = (b"Authentication-Results: amazonses.com; spf=fail; dkim=fail header.i=@mg.mercury.com\r\n"
+           b"Authentication-Results: mx.google.com; dkim=pass header.i=@mg.mercury.com\r\n"
+           b"From: hello@mercury.com\r\n\r\nbody")
+    r = pl.dkim_check({}, ["unauthenticated"], "message.received.unauthenticated",
+                      raw_fetch=lambda: raw)
+    assert r.verdict == "fail"
+
+
+def test_dkim_parsed_pass_never_calls_raw_fetch():
+    # (d) the existing passing cases are untouched: a parsed-header pass decides
+    # on its own, source="parsed", and the raw message is never downloaded.
+    def must_not_run():
+        raise AssertionError("raw fetched although parsed headers decided")
+    h = {"Authentication-Results": "mx.google.com; dkim=pass header.i=@mg.mercury.com header.s=pic"}
+    r = pl.dkim_check(h, [], "message.received", raw_fetch=must_not_run)
+    assert r.verdict == "pass" and r.strength == "strong" and r.source == "parsed"
+    bad = {"Authentication-Results": "mx.google.com; dkim=pass header.i=@evil.com"}
+    assert pl.dkim_check(bad, [], "message.received", raw_fetch=must_not_run).verdict == "fail"
+
+
+def test_evaluate_does_not_fetch_raw_for_non_payment_shaped_mail():
+    def must_not_run():
+        raise AssertionError("raw fetched for spam")
+    d = pl.evaluate(["cort@staygoldenhawaii.com"], {}, "🎄 From $12: Watercolor winter",
+                    [], "message.received", raw_fetch=must_not_run)
+    assert d.qualified is False and d.dkim.verdict == "unknown"

@@ -27,9 +27,11 @@ staygoldenhi.com re-sign: Mercury signs d=mg.mercury.com (selector pic), and
 Google's Authentication-Results carries it through as dkim=pass
 header.i=@mg.mercury.com. So the gate accepts the staygoldenhi.com alias AND
 Mercury's own signing domains (_ACCEPTED_DKIM_DOMAINS) — a direct spoof to
-cortana.h can produce none of them. The DKIM check is layered and *fails closed*,
-and if AgentMail exposes no auth headers it logs prominently and gates on
-recipient + subject + AgentMail's own auth verdict (per the plan's fallback).
+cortana.h can produce none of them. The DKIM check is layered and *fails closed*.
+If AgentMail's parsed headers expose no auth headers, it re-reads them from the
+raw .eml (an injected fetcher; source="raw-fallback"); only if that also comes up
+empty does it log prominently and gate on recipient + subject + AgentMail's own
+auth verdict (per the plan's fallback).
 
 The pure functions (extract_finance_code / parse_payment_subject / dkim_check /
 evaluate) take plain values so they unit-test without the AgentMail SDK.
@@ -45,6 +47,8 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from email.parser import BytesHeaderParser
+from typing import Callable
 
 log = logging.getLogger("cc-mail")
 
@@ -177,6 +181,7 @@ class DkimResult:
     strength: str         # "strong" | "medium" | "present-no-match" | "unavailable"
     authed: bool          # AgentMail's own auth verdict (not the DKIM domain check)
     detail: str
+    source: str = "parsed"  # "parsed" (AgentMail's header view) | "raw-fallback" (the .eml)
 
 
 # DKIM signing domains that prove a genuine Mercury GPO payment notification. On a
@@ -200,22 +205,8 @@ def _accepted_dkim_domain(text: str) -> str | None:
     return None
 
 
-def dkim_check(headers: dict | None, labels: list[str] | None, event_type: str) -> DkimResult:
-    """Verify DKIM from an accepted signing domain, layered + fail-closed.
-
-    Accepted domains (_ACCEPTED_DKIM_DOMAINS): the staygoldenhi.com re-sign AND
-    Mercury's own signing domains — on a Gmail auto-forward the surviving DKIM pass
-    is the ORIGIN (d=mg.mercury.com), not the SG alias.
-
-    Preference: (1) an Authentication-Results clause with dkim=pass AND an accepted
-    domain; else (2) a DKIM-Signature carrying d=<accepted domain>, trusted only if
-    AgentMail also marked the message authenticated; else (3) unknown — no usable
-    auth headers exposed (caller logs + gates on the rest).
-    """
-    h = _ci_headers(headers)
-    labels = [str(x).lower() for x in (labels or [])]
-    authed = "unauthenticated" not in labels and event_type != "message.received.unauthenticated"
-
+def _dkim_from_headers(h: dict, authed: bool) -> DkimResult:
+    """The layered DKIM decision over a lowercased header dict (see dkim_check)."""
     ar = h.get("authentication-results") or h.get("arc-authentication-results") or ""
     if ar:
         for clause in ar.split(";"):
@@ -248,6 +239,94 @@ def dkim_check(headers: dict | None, labels: list[str] | None, event_type: str) 
                       f"auth headers present but no accepted dkim=pass domain (ar={ar[:120]!r})")
 
 
+def raw_auth_headers(raw: bytes | str) -> dict:
+    """Pull the auth headers dkim_check reads out of a raw RFC-822 message.
+
+    Returns a dict shaped like AgentMail's parsed `headers`, so the SAME layered
+    decision runs over it. Only the TOPMOST instance of each header is kept: that
+    is the one the final receiver (AgentMail's SES, authserv-id amazonses.com)
+    prepended. Lower copies travelled with the message, and a direct sender can
+    write any Authentication-Results it likes into its own headers (RFC 8601 §5),
+    so reading past the top would let a spoof vouch for itself. ARC-AR is kept
+    at its highest instance (i=N) for the same reason, and is only consulted when
+    there is no Authentication-Results at all — exactly as on the parsed path.
+    """
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "replace")
+    msg = BytesHeaderParser().parsebytes(raw)
+
+    def unfold(v) -> str:
+        return " ".join(str(v).split())
+
+    out: dict = {}
+    ar = msg.get_all("Authentication-Results") or []
+    if ar:
+        out["Authentication-Results"] = unfold(ar[0])
+    arc = msg.get_all("ARC-Authentication-Results") or []
+    if arc:
+        def inst(v) -> int:
+            m = re.match(r"\s*i\s*=\s*(\d+)", str(v))
+            return int(m.group(1)) if m else 0
+        out["ARC-Authentication-Results"] = unfold(max(arc, key=inst))
+    sig = msg.get_all("DKIM-Signature") or []
+    if sig:
+        out["DKIM-Signature"] = unfold(sig[0])
+    return out
+
+
+RawFetcher = Callable[[], "bytes | str | None"]
+
+
+def dkim_check(
+    headers: dict | None,
+    labels: list[str] | None,
+    event_type: str,
+    raw_fetch: RawFetcher | None = None,
+) -> DkimResult:
+    """Verify DKIM from an accepted signing domain, layered + fail-closed.
+
+    Accepted domains (_ACCEPTED_DKIM_DOMAINS): the staygoldenhi.com re-sign AND
+    Mercury's own signing domains — on a Gmail auto-forward the surviving DKIM pass
+    is the ORIGIN (d=mg.mercury.com), not the SG alias.
+
+    Preference: (1) an Authentication-Results clause with dkim=pass AND an accepted
+    domain; else (2) a DKIM-Signature carrying d=<accepted domain>, trusted only if
+    AgentMail also marked the message authenticated; else (3) unknown — no usable
+    auth headers exposed (caller logs + gates on the rest).
+
+    Raw fallback (2026-10-16): AgentMail's parsed header view can omit BOTH auth
+    headers even though the .eml carries them (MERC-pet / MERC-cle that morning).
+    When it does and the caller injected `raw_fetch` (returns the raw RFC-822
+    message), the same decision runs over the raw message's topmost auth headers
+    and the result is tagged source="raw-fallback". A fetch that raises or comes
+    back empty leaves the verdict unknown(unavailable) — never fabricated.
+    """
+    h = _ci_headers(headers)
+    labels = [str(x).lower() for x in (labels or [])]
+    authed = "unauthenticated" not in labels and event_type != "message.received.unauthenticated"
+
+    parsed = _dkim_from_headers(h, authed)
+    if parsed.verdict != "unknown" or raw_fetch is None:
+        return parsed
+
+    try:
+        raw = raw_fetch()
+    except Exception as e:
+        parsed.detail += f"; raw-fallback fetch failed ({type(e).__name__}: {str(e)[:120]})"
+        return parsed
+    if not raw:
+        parsed.detail += "; raw-fallback fetch returned nothing"
+        return parsed
+
+    res = _dkim_from_headers(_ci_headers(raw_auth_headers(raw)), authed)
+    res.source = "raw-fallback"
+    if res.verdict == "unknown":
+        res.detail = "no Authentication-Results / DKIM-Signature in parsed headers OR raw message"
+    else:
+        res.detail = f"raw-fallback: {res.detail}"
+    return res
+
+
 @dataclass
 class Decision:
     qualified: bool
@@ -269,12 +348,19 @@ def evaluate(
     subject: str | None,
     labels: list[str] | None,
     event_type: str,
+    raw_fetch: RawFetcher | None = None,
 ) -> Decision:
-    """Combine the three gate layers into a qualify/ignore decision."""
+    """Combine the three gate layers into a qualify/ignore decision.
+
+    `raw_fetch` (optional) is handed to dkim_check for the raw-message fallback.
+    It is only offered for payment-SHAPED mail (recipient or subject matched), so
+    plain spam on the inbox never costs a raw download.
+    """
     reasons: list[str] = []
     code = extract_finance_code(recipients, headers)
     subj = parse_payment_subject(subject)
-    dk = dkim_check(headers, labels, event_type)
+    shaped = code is not None or subj is not None
+    dk = dkim_check(headers, labels, event_type, raw_fetch=raw_fetch if shaped else None)
 
     if code is None:
         reasons.append("recipient does not match finance+<code>@staygoldenhi.com")
@@ -394,8 +480,8 @@ def build_cortana_prompt(
         f"Case ref: {decision.case_ref}\n"
         f"Parsed by the gate (verify against the body): payor={decision.payor!r}, "
         f"amount=${decision.amount}, finance code={decision.code!r}\n"
-        f"DKIM gate: {decision.dkim.verdict} ({decision.dkim.strength}) — "
-        f"{decision.dkim.detail}\n\n"
+        f"DKIM gate: {decision.dkim.verdict} ({decision.dkim.strength}, "
+        f"via {decision.dkim.source}) — {decision.dkim.detail}\n\n"
         f"{thread_block}"
         f"From: {raw_from}\n"
         f"Subject: {subject}\n\n"
