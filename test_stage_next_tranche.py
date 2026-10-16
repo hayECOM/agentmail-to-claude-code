@@ -9,6 +9,7 @@ nothing here touches a real base.
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 
@@ -290,11 +291,12 @@ def test_lock_timeout_raises_and_main_creates_nothing(tmp_path, monkeypatch, cap
         raise AssertionError("ran without the lock")
     monkeypatch.setattr(st, "run", must_not_run)
     with st.tranche_lock(lock, timeout=1):
-        with pytest.raises(TimeoutError):
+        with pytest.raises(st.LockBusy):
             with st.tranche_lock(lock, timeout=0.3):
                 pass
         assert st.main(["--base", "prod", "--invoice", INV89["id"]]) == 1
-    assert capsys.readouterr().out.startswith("TRANCHE ERROR")
+    out = capsys.readouterr().out
+    assert out.startswith("TRANCHE ERROR") and "lock busy, nothing created" in out
 
 
 # --- review r1 F4: the PO note append survives an intervening writer ---------------
@@ -368,3 +370,68 @@ def test_noop_repair_skipped_on_dry_run():
     code, line = st.run(at, INV89["id"], "10/16/2026", dry_run=False)
     assert line.startswith("TRANCHE NOOP (note repaired)")
     assert "INV#92 staged at Estimate ($40,099.92" in at.records[PO_ID]["fields"]["Notes"]
+
+
+# --- review r2 X4: a create that may have committed is never "nothing created" -----
+
+class _Resp:
+    def __init__(self, body=None, exc=None):
+        self.body, self.exc = body, exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        if self.exc:
+            raise self.exc
+        return json.dumps(self.body).encode()
+
+
+def test_create_response_read_timeout_prints_create_ambiguous(tmp_path, monkeypatch, capsys):
+    # py3.12: a slow Airtable response raises a bare TimeoutError from read() AFTER
+    # the POST went out. The create may have committed; "nothing created" would send
+    # the operator off to hand-stage a duplicate.
+    monkeypatch.setattr(st, "LOCK_DIR", tmp_path)
+    monkeypatch.setenv("AIRTABLE_PAT", "pat")
+    monkeypatch.setenv("AIRTABLE_BASE_PROD", "appX")
+    records = {INV89["id"]: INV89, PO_ID: _po([INV89["id"]])}
+    posts = []
+
+    def urlopen(req, timeout=None):
+        if req.get_method() == "POST":
+            posts.append(req)
+            return _Resp(exc=TimeoutError("The read operation timed out"))
+        return _Resp(body=copy.deepcopy(records[req.full_url.rsplit("/", 1)[1]]))
+    monkeypatch.setattr(st.urllib.request, "urlopen", urlopen)
+
+    assert st.main(["--base", "prod", "--invoice", INV89["id"], "--date", "10/16/2026"]) == 1
+    out = capsys.readouterr().out
+    assert len(posts) == 1
+    assert out.startswith("TRANCHE ERROR")
+    assert "create may have been committed" in out and "rerun" in out
+    assert "nothing created" not in out and "lock busy" not in out
+
+
+# --- review r2 X6: note repair refuses rather than write invented numbers ---------
+
+_HELPER_STAGED = _with(INV92, Notes="10/16/2026: 70% balance tranche of 30/70 on GPO#47-CLE — "
+                                    "Estimate staged from INV#89 ($17,185.68 × 70/30 = "
+                                    "$40,099.92) (Cortana)")
+
+
+@pytest.mark.parametrize("edit", [
+    {"Invoice Amount": None},
+    {"Invoice Amount": 40099.925},
+    {"Payment Terms": "Net 30"},
+    {"Payment Terms": ""},
+])
+def test_note_repair_refuses_an_unfaithful_line(edit):
+    sibling = _with(_HELPER_STAGED, **edit)
+    at = FakeAirtable([INV89, sibling, _po([INV89["id"], INV92["id"]])])
+    code, line = st.run(at, INV89["id"], "10/17/2026", dry_run=False)
+    assert code == 0 and line.startswith("TRANCHE NOOP ") and "repaired" not in line, line
+    assert at.patched == []
+    assert st.po_note_line("10/17/2026", sibling, INV89) is None

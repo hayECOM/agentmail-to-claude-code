@@ -82,31 +82,35 @@ A lane-2 email qualifies only if **all three** hold:
 2. **Subject** matches `"<payor> sent you $X"`. A `Re:`/`Fwd:` prefix disqualifies
    it — an auto-forwarded Mercury notification keeps its original subject, so those
    prefixes mark a human reply or manual forward, not the payment itself.
-3. **DKIM** from an accepted signing domain is verifiable from the raw headers —
-   layered and **fail-closed**: (a) an `Authentication-Results` clause with
-   `dkim=pass` + an accepted domain — an AR that is present *without* one is a
-   **fail**, never a fall-through; else, only when there is no AR at all, (b) a
-   `DKIM-Signature` carrying `d=<accepted domain>`, trusted only if AgentMail also
-   marked the message authenticated (signatures are presence-checked, never
-   verified, so they can't outrank a receiver's `dkim=fail`); else, when AgentMail's
-   *parsed* headers carry neither, the decision re-runs over the **raw .eml**
-   (`GET /messages/<id>/raw` → `download_url`) and the verdict says
-   `dkim_via=raw-fallback` in the daemon log and the Cortana brief (added
-   2026-10-16, when the parsed view went blind on every message). The raw path reads
-   **only** the first `Authentication-Results` whose authserv-id is one of our
-   receivers (`amazonses.com`, `mx.google.com`) — any other AR, every
-   `ARC-Authentication-Results` and every `DKIM-Signature` are ignored there, since a
-   sender can write all of them. No receiver-anchored AR in the raw message is a
-   **fail** (`no-receiver-ar`), which lands in the near-miss ping. The raw fetch runs
-   only for payment-shaped mail. A failed fetch stays (c) **unknown** — no auth
-   headers anywhere, which is
-   logged **prominently** (`LANE2 DKIM-HEADERS-UNAVAILABLE`) and the mail is gated on
-   recipient + subject + AgentMail's own auth verdict (per the plan's fallback). A
-   present-but-wrong DKIM domain is rejected. Accepted domains are `staygoldenhi.com`
-   (the Gmail auto-forward's re-sign) plus Mercury's own `mg.mercury.com` / bare
-   `mercury.com` — because on a forwarded message the surviving `dkim=pass` is the
-   **origin** domain (Mercury signs `d=mg.mercury.com`, selector `pic`), not the SG
-   alias; the match is boundary-anchored so look-alikes (`evilmercury.com`) can't slip through.
+3. **DKIM** from an accepted signing domain is verifiable from a trusted receiver —
+   layered and **fail-closed** (final posture after review r2, 2026-10-16):
+   - Only an `Authentication-Results` whose authserv-id is one of our receivers
+     (`amazonses.com`, `mx.google.com`) is ever read, on the parsed and raw paths
+     alike. Any other AR, every `ARC-Authentication-Results` and (while the raw
+     path is available) every `DKIM-Signature` are ignored, since a sender can write
+     all of them. A trusted AR is **authoritative**: it passes only on a `dkim=pass`
+     clause — comments stripped, the method opening the clause — whose parsed
+     signing domain (`header.d=`, else the domain part after the last `@` of
+     `header.i=`) is *exactly* an accepted domain. `header.i=mercury.com@attacker.example`
+     is `attacker.example`; anything else is a **fail**, never a fall-through.
+   - When AgentMail's *parsed* headers carry no trusted AR (the parsed view went
+     blind on every message 2026-10-16), the decision re-runs over the **raw .eml**
+     (`GET /messages/<id>/raw` → `download_url`) *before* any signature check, and
+     the verdict says `dkim_via=raw-fallback` in the daemon log and the Cortana brief.
+     The raw path takes the first trusted AR top-down. None in the raw message is a
+     **fail** (`no-receiver-ar`); a fetch that fails twice (one retry,
+     `CC_LANE2_RAW_RETRY_DELAY`, default 2s) is a **fail** (`fetch-failed`). Both land
+     in the near-miss ping. The raw fetch runs only for payment-shaped mail.
+   - Only for a caller that injects no raw fetcher (legacy/tests) does a
+     `DKIM-Signature` carrying `d=<accepted domain>` + AgentMail's authenticated
+     label pass (`medium`). No auth headers at all is `unknown` and **never
+     qualifies** — AgentMail's generic auth bit alone is not enough for a payment.
+
+   Accepted domains are `staygoldenhi.com` (the Gmail auto-forward's re-sign) plus
+   Mercury's own `mg.mercury.com` / bare `mercury.com` — because on a forwarded
+   message the surviving `dkim=pass` is the **origin** domain (Mercury signs
+   `d=mg.mercury.com`, selector `pic`), not the SG alias. The comparison is exact
+   equality, so look-alikes (`evilmercury.com`, `mercury.com.evil`) can't slip through.
 
 On a qualifying email the lane writes a Cortana brief to
 `CC_HOME/payment-prompts/<case-ref>.md` and spawns a **Cortana** session via
@@ -149,9 +153,14 @@ and appends a dated line to the PO's `Notes`. Anything not forced by arithmetic
 move the split base) prints `TRANCHE FLAG …` and exits 3 for the session to
 escalate; a seq-2 sibling in any status is a `NOOP` — and if that sibling is an
 Estimate this helper staged whose PO note never landed (an earlier `PARTIAL`), the
-NOOP appends the missing line (`NOOP (note repaired)`). Runs are serialized by an
+NOOP appends the missing line (`NOOP (note repaired)`) — unless the sibling's amount
+or terms were edited so they no longer reproduce a faithful line, in which case it
+writes nothing (plain `NOOP`). Runs are serialized by an
 exclusive `flock` on `CC_HOME/tranche-stage.<base>.lock` (`TRANCHE_LOCK_TIMEOUT`,
-default 120s; on timeout it creates nothing and prints `TRANCHE ERROR`), and the PO
+default 120s; on timeout it creates nothing and prints `TRANCHE ERROR … lock busy`).
+Any failure once the create POST is out (e.g. a response-read timeout) prints
+`TRANCHE ERROR … create may have been committed — rerun to verify`; a rerun NOOPs or
+repairs safely, so never hand-stage on that line. The PO
 is re-read right before the note PATCH so another writer's note survives. It's a helper the session
 calls, not daemon post-processing, so the session stays the only prod writer.
 Stdlib-only; PAT + base ids from `~/Workspace/tools/po-payment-flow/.env`;
@@ -365,7 +374,7 @@ dispatch.
 ```
 
 The payment-lane tests (`test_payment_lane.py`) cover each gate layer
-(recipient / subject / DKIM incl. the headers-unavailable fallback) and spawn the
+(recipient / subject / DKIM incl. the raw fallback and its fail-closed edges) and spawn the
 Cortana session against a fake `spawn-coder.sh` (test-coder.sh fake-binary style).
 
 ## Security notes

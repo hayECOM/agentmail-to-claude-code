@@ -22,12 +22,16 @@ to escalate. A guessed estimate is worse than none.
 Idempotent: a sibling invoice at seq + 1 in any status means NOOP. When that
 sibling is one this helper staged (Estimate, carrying the helper's invoice note)
 and the PO note naming it is missing — a prior run that ended PARTIAL — the NOOP
-appends the missing PO line and says `NOOP (note repaired)`.
+appends the missing PO line and says `NOOP (note repaired)` — unless the sibling's
+amount or terms no longer reproduce a faithful line (an edited Estimate), in which
+case it writes nothing and says plain `NOOP`.
 
 Concurrency: the whole read -> check -> create -> note sequence runs under an
 exclusive flock on CC_HOME/tranche-stage.<base>.lock, so two runs on one box can't
 both see "no seq 2" and both create. A run that can't get the lock within
-TRANCHE_LOCK_TIMEOUT seconds creates nothing and prints TRANCHE ERROR.
+TRANCHE_LOCK_TIMEOUT seconds creates nothing and prints TRANCHE ERROR ... lock busy.
+Any failure once the create POST has been sent (incl. a response-read timeout)
+prints TRANCHE ERROR ... create may have been committed — a rerun NOOPs/repairs.
 
 Output is one line, `TRANCHE <STAGED|NOOP|SKIP|FLAG> ...`. Exit 0 for
 STAGED/NOOP/SKIP, 3 for FLAG (escalate), 1 for an error (nothing or a partial
@@ -172,15 +176,23 @@ def plan_next_tranche(paid: dict, po_invoices: list[dict], po_name: str, note_da
                 amount_cents=amount, pct=second)
 
 
-def po_note_line(note_date: str, staged: dict, paid: dict) -> str:
+def po_note_line(note_date: str, staged: dict, paid: dict) -> str | None:
     """The PO Notes line recording a staged balance invoice. Built from the staged
-    record itself so a NOOP repair writes the same line the staging run would have."""
+    record itself so a NOOP repair writes the same line the staging run would have.
+
+    None when the record can't reproduce a faithful line — amount not a positive
+    whole-cent value, or terms not a clean two-part split of 100 (an Estimate
+    edited since staging). A money note never gets an invented $0.00 / 0% (r2 X6).
+    """
     sf = staged.get("fields", {})
-    terms = sf.get("Payment Terms") or ""
+    terms = (sf.get("Payment Terms") or "").strip()
     m = _SPLIT_RE.match(terms)
-    pct = int(m.group(2)) if m else 0
+    cents = _cents(sf.get("Invoice Amount"))
+    if not m or int(m.group(1)) + int(m.group(2)) != 100 or not int(m.group(1)) \
+            or not cents or cents <= 0:
+        return None
     return (f"{note_date}: {_short(staged)} staged at Estimate "
-            f"({fmt_usd(_cents(sf.get('Invoice Amount')) or 0)}, {pct}% balance per {terms} "
+            f"({fmt_usd(cents)}, {int(m.group(2))}% balance per {terms} "
             f"terms on {_short(paid)}) (Cortana)")
 
 
@@ -196,9 +208,14 @@ def needs_note_repair(sibling: dict, paid: dict, po_notes: str | None) -> bool:
     return f"{_short(sibling)} staged at Estimate" not in (po_notes or "")
 
 
+class LockBusy(Exception):
+    """The tranche lock is still held by another run. Its own type so main() can't
+    mistake an Airtable TimeoutError for it (review r2 X4)."""
+
+
 @contextlib.contextmanager
 def tranche_lock(path: pathlib.Path, timeout: float):
-    """Exclusive flock on `path`, polled until `timeout` seconds; TimeoutError if
+    """Exclusive flock on `path`, polled until `timeout` seconds; LockBusy if
     another run still holds it. Released when the block exits (or the process dies)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as fh:
@@ -209,7 +226,7 @@ def tranche_lock(path: pathlib.Path, timeout: float):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"{path} still held after {timeout:g}s") from None
+                    raise LockBusy(f"{path} still held after {timeout:g}s") from None
                 time.sleep(0.2)
         try:
             yield
@@ -273,8 +290,8 @@ def run(at: Airtable, invoice_id: str, note_date: str, dry_run: bool) -> tuple[i
     if plan.action == "noop" and not dry_run:
         fresh = at.get(PURCHASE_ORDERS, po["id"])  # re-read right before the append
         notes = fresh.get("fields", {}).get("Notes")
-        if needs_note_repair(plan.sibling, paid, notes):
-            line = po_note_line(note_date, plan.sibling, paid)
+        line = po_note_line(note_date, plan.sibling, paid)
+        if line is not None and needs_note_repair(plan.sibling, paid, notes):
             try:
                 at.patch(PURCHASE_ORDERS, po["id"], {"Notes": append_note(notes, line)})
             except Exception as e:
@@ -288,10 +305,18 @@ def run(at: Airtable, invoice_id: str, note_date: str, dry_run: bool) -> tuple[i
         shown = {**plan.fields, "Invoice PDF": [a["filename"] for a in plan.fields.get("Invoice PDF", [])]}
         return 0, f"TRANCHE DRY-RUN {head}: would stage {what}; fields={json.dumps(shown, ensure_ascii=False)}"
 
-    created = at.create(INVOICES, plan.fields)
+    try:
+        created = at.create(INVOICES, plan.fields)
+    except Exception as e:
+        # The POST went out; a timeout or error reading the response says nothing
+        # about whether Airtable committed it (review r2 X4).
+        return 1, (f"TRANCHE ERROR {head}: create may have been committed — rerun to "
+                   f"verify (a rerun NOOPs/repairs safely): {type(e).__name__}: {e}")
     new_label = _short(created)
     po_line = po_note_line(note_date, created, paid)
     try:
+        if po_line is None:
+            raise RuntimeError("staged record doesn't reproduce a faithful note line")
         # Re-read right before the append so a note another writer added since the
         # first GET survives (the lock only serializes helper runs).
         fresh = at.get(PURCHASE_ORDERS, po["id"])
@@ -334,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with tranche_lock(lock, LOCK_TIMEOUT_S):
             code, line = run(Airtable(pat, base), a.invoice, note_date, a.dry_run)
-    except TimeoutError as e:
+    except LockBusy as e:
         code, line = 1, f"TRANCHE ERROR {a.invoice}: lock busy, nothing created ({e})"
     except Exception as e:
         code, line = 1, f"TRANCHE ERROR {a.invoice}: {e}"
