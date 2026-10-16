@@ -206,7 +206,14 @@ def _accepted_dkim_domain(text: str) -> str | None:
 
 
 def _dkim_from_headers(h: dict, authed: bool) -> DkimResult:
-    """The layered DKIM decision over a lowercased header dict (see dkim_check)."""
+    """The layered DKIM decision over a lowercased header dict (see dkim_check).
+
+    An Authentication-Results header, when present, is AUTHORITATIVE: no accepted-
+    domain dkim=pass clause in it means fail, full stop. The DKIM-Signature tier is
+    consulted only when there is no AR at all — signatures are never verified
+    cryptographically here (presence only), so a fabricated `d=mg.mercury.com` must
+    never outrank a receiver's explicit dkim=fail (review r1 F1).
+    """
     ar = h.get("authentication-results") or h.get("arc-authentication-results") or ""
     if ar:
         for clause in ar.split(";"):
@@ -216,8 +223,14 @@ def _dkim_from_headers(h: dict, authed: bool) -> DkimResult:
                 if matched:
                     return DkimResult("pass", "strong", authed,
                                       f"Authentication-Results dkim=pass {matched}")
+        return DkimResult("fail", "present-no-match", authed,
+                          f"Authentication-Results carries no accepted dkim=pass domain "
+                          f"(ar={ar[:120]!r})")
 
     sig = (h.get("dkim-signature") or "").replace(" ", "").lower()
+    if not sig:
+        return DkimResult("unknown", "unavailable", authed,
+                          "no Authentication-Results / DKIM-Signature headers exposed by AgentMail")
     sig_domain = next(
         (d for d in _ACCEPTED_DKIM_DOMAINS
          if re.search(rf"(?:^|;)d={re.escape(d)}(?:;|$)", sig)),
@@ -230,48 +243,44 @@ def _dkim_from_headers(h: dict, authed: bool) -> DkimResult:
         return DkimResult("fail", "medium", authed,
                           f"DKIM-Signature d={sig_domain} but AgentMail flagged unauthenticated")
 
-    if not ar and not sig:
-        return DkimResult("unknown", "unavailable", authed,
-                          "no Authentication-Results / DKIM-Signature headers exposed by AgentMail")
-
-    # Auth headers present but no accepted DKIM pass -> spoof/misalign, reject.
+    # A signature from some other domain -> spoof/misalign, reject.
     return DkimResult("fail", "present-no-match", authed,
-                      f"auth headers present but no accepted dkim=pass domain (ar={ar[:120]!r})")
+                      "DKIM-Signature present but no accepted signing domain")
+
+
+# The receivers whose Authentication-Results we trust on the raw path: AgentMail's
+# SES (the final hop, always stamps) and Google (the auto-forward hop). An AR with
+# any other authserv-id was written by someone we don't run (review r1 F2).
+_TRUSTED_AUTHSERV_IDS = ("amazonses.com", "mx.google.com")
+
+
+def _authserv_id(ar_value: str) -> str:
+    """The authserv-id of an Authentication-Results value: its first token, before
+    the first ';' (RFC 8601 §2.2 — an optional version may follow the id)."""
+    head = ar_value.split(";", 1)[0].split()
+    return head[0].lower() if head else ""
 
 
 def raw_auth_headers(raw: bytes | str) -> dict:
-    """Pull the auth headers dkim_check reads out of a raw RFC-822 message.
+    """Pull the one trusted Authentication-Results out of a raw RFC-822 message.
 
-    Returns a dict shaped like AgentMail's parsed `headers`, so the SAME layered
-    decision runs over it. Only the TOPMOST instance of each header is kept: that
-    is the one the final receiver (AgentMail's SES, authserv-id amazonses.com)
-    prepended. Lower copies travelled with the message, and a direct sender can
-    write any Authentication-Results it likes into its own headers (RFC 8601 §5),
-    so reading past the top would let a spoof vouch for itself. ARC-AR is kept
-    at its highest instance (i=N) for the same reason, and is only consulted when
-    there is no Authentication-Results at all — exactly as on the parsed path.
+    Returns a dict shaped like AgentMail's parsed `headers` — either
+    {"Authentication-Results": ...} or {} — so the same decision runs over it.
+
+    Scans top-down and keeps the FIRST AR whose authserv-id is one of our actual
+    receivers (_TRUSTED_AUTHSERV_IDS); SES prepends its stamp, so in real mail that
+    is the topmost header. An AR with any other authserv-id is ignored, as is every
+    ARC-Authentication-Results (a sender can mint its own ARC set at any i=) and
+    every DKIM-Signature (presence is not verification). Review r1 F1/F2.
     """
     if isinstance(raw, str):
         raw = raw.encode("utf-8", "replace")
     msg = BytesHeaderParser().parsebytes(raw)
-
-    def unfold(v) -> str:
-        return " ".join(str(v).split())
-
-    out: dict = {}
-    ar = msg.get_all("Authentication-Results") or []
-    if ar:
-        out["Authentication-Results"] = unfold(ar[0])
-    arc = msg.get_all("ARC-Authentication-Results") or []
-    if arc:
-        def inst(v) -> int:
-            m = re.match(r"\s*i\s*=\s*(\d+)", str(v))
-            return int(m.group(1)) if m else 0
-        out["ARC-Authentication-Results"] = unfold(max(arc, key=inst))
-    sig = msg.get_all("DKIM-Signature") or []
-    if sig:
-        out["DKIM-Signature"] = unfold(sig[0])
-    return out
+    for v in msg.get_all("Authentication-Results") or []:
+        value = " ".join(str(v).split())
+        if _authserv_id(value) in _TRUSTED_AUTHSERV_IDS:
+            return {"Authentication-Results": value}
+    return {}
 
 
 RawFetcher = Callable[[], "bytes | str | None"]
@@ -290,16 +299,20 @@ def dkim_check(
     is the ORIGIN (d=mg.mercury.com), not the SG alias.
 
     Preference: (1) an Authentication-Results clause with dkim=pass AND an accepted
-    domain; else (2) a DKIM-Signature carrying d=<accepted domain>, trusted only if
-    AgentMail also marked the message authenticated; else (3) unknown — no usable
-    auth headers exposed (caller logs + gates on the rest).
+    domain — and if an AR is present without one, that is a fail, never a fall-
+    through; else, only when there is NO AR, (2) a DKIM-Signature carrying
+    d=<accepted domain>, trusted only if AgentMail also marked the message
+    authenticated; else (3) unknown — no usable auth headers exposed (caller logs +
+    gates on the rest).
 
     Raw fallback (2026-10-16): AgentMail's parsed header view can omit BOTH auth
     headers even though the .eml carries them (MERC-pet / MERC-cle that morning).
     When it does and the caller injected `raw_fetch` (returns the raw RFC-822
-    message), the same decision runs over the raw message's topmost auth headers
-    and the result is tagged source="raw-fallback". A fetch that raises or comes
-    back empty leaves the verdict unknown(unavailable) — never fabricated.
+    message), the decision runs over the raw message's first receiver-anchored
+    Authentication-Results ONLY (see raw_auth_headers) and is tagged
+    source="raw-fallback". The signature tier never runs on this path: a raw
+    message with no trusted AR is fail(no-receiver-ar). A fetch that raises or
+    comes back empty leaves the verdict unknown(unavailable) — never fabricated.
     """
     h = _ci_headers(headers)
     labels = [str(x).lower() for x in (labels or [])]
@@ -318,12 +331,19 @@ def dkim_check(
         parsed.detail += "; raw-fallback fetch returned nothing"
         return parsed
 
-    res = _dkim_from_headers(_ci_headers(raw_auth_headers(raw)), authed)
+    rh = _ci_headers(raw_auth_headers(raw))
+    if not rh:
+        # Real Mercury mail always carries SES's stamp. No receiver-anchored AR
+        # means the raw message can't vouch for itself: fail, so a payment-shaped
+        # email lands in the near-miss ping for human eyes instead of qualifying
+        # on AgentMail's authed bit alone.
+        return DkimResult("fail", "no-receiver-ar", authed,
+                          f"raw-fallback: no Authentication-Results from a known receiver "
+                          f"({' / '.join(_TRUSTED_AUTHSERV_IDS)}) in the raw message",
+                          source="raw-fallback")
+    res = _dkim_from_headers(rh, authed)
     res.source = "raw-fallback"
-    if res.verdict == "unknown":
-        res.detail = "no Authentication-Results / DKIM-Signature in parsed headers OR raw message"
-    else:
-        res.detail = f"raw-fallback: {res.detail}"
+    res.detail = f"raw-fallback: {res.detail}"
     return res
 
 

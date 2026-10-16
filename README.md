@@ -84,15 +84,22 @@ A lane-2 email qualifies only if **all three** hold:
    prefixes mark a human reply or manual forward, not the payment itself.
 3. **DKIM** from an accepted signing domain is verifiable from the raw headers —
    layered and **fail-closed**: (a) an `Authentication-Results` clause with
-   `dkim=pass` + an accepted domain; else (b) a `DKIM-Signature` carrying
-   `d=<accepted domain>`, trusted only if AgentMail also marked the message
-   authenticated; else, when AgentMail's *parsed* headers carry neither, the same
-   decision re-runs over the **raw .eml** (`GET /messages/<id>/raw` → `download_url`),
-   reading only the topmost `Authentication-Results` (the receiver's own stamp — lower
-   copies can be written by the sender) and the verdict says `dkim_via=raw-fallback`
-   in the daemon log and the Cortana brief (added 2026-10-16, when the parsed view
-   went blind on every message). The raw fetch runs only for payment-shaped mail. A
-   failed fetch stays (c) **unknown** — no auth headers anywhere, which is
+   `dkim=pass` + an accepted domain — an AR that is present *without* one is a
+   **fail**, never a fall-through; else, only when there is no AR at all, (b) a
+   `DKIM-Signature` carrying `d=<accepted domain>`, trusted only if AgentMail also
+   marked the message authenticated (signatures are presence-checked, never
+   verified, so they can't outrank a receiver's `dkim=fail`); else, when AgentMail's
+   *parsed* headers carry neither, the decision re-runs over the **raw .eml**
+   (`GET /messages/<id>/raw` → `download_url`) and the verdict says
+   `dkim_via=raw-fallback` in the daemon log and the Cortana brief (added
+   2026-10-16, when the parsed view went blind on every message). The raw path reads
+   **only** the first `Authentication-Results` whose authserv-id is one of our
+   receivers (`amazonses.com`, `mx.google.com`) — any other AR, every
+   `ARC-Authentication-Results` and every `DKIM-Signature` are ignored there, since a
+   sender can write all of them. No receiver-anchored AR in the raw message is a
+   **fail** (`no-receiver-ar`), which lands in the near-miss ping. The raw fetch runs
+   only for payment-shaped mail. A failed fetch stays (c) **unknown** — no auth
+   headers anywhere, which is
    logged **prominently** (`LANE2 DKIM-HEADERS-UNAVAILABLE`) and the mail is gated on
    recipient + subject + AgentMail's own auth verdict (per the plan's fallback). A
    present-but-wrong DKIM domain is rejected. Accepted domains are `staygoldenhi.com`
@@ -140,7 +147,12 @@ the ratio to the cent (`$17,185.68 × 70/30 = $40,099.92`), the paid tranche's P
 and appends a dated line to the PO's `Notes`. Anything not forced by arithmetic
 (three-part terms, a ratio off whole cents, any other invoice on the PO that could
 move the split base) prints `TRANCHE FLAG …` and exits 3 for the session to
-escalate; a seq-2 sibling in any status is a `NOOP`. It's a helper the session
+escalate; a seq-2 sibling in any status is a `NOOP` — and if that sibling is an
+Estimate this helper staged whose PO note never landed (an earlier `PARTIAL`), the
+NOOP appends the missing line (`NOOP (note repaired)`). Runs are serialized by an
+exclusive `flock` on `CC_HOME/tranche-stage.<base>.lock` (`TRANCHE_LOCK_TIMEOUT`,
+default 120s; on timeout it creates nothing and prints `TRANCHE ERROR`), and the PO
+is re-read right before the note PATCH so another writer's note survives. It's a helper the session
 calls, not daemon post-processing, so the session stays the only prod writer.
 Stdlib-only; PAT + base ids from `~/Workspace/tools/po-payment-flow/.env`;
 `--dry-run` writes nothing.

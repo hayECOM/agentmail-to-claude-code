@@ -464,8 +464,9 @@ def test_raw_auth_headers_takes_topmost_receiver_stamp():
     h = pl.raw_auth_headers(_RAW_CLE)
     assert h["Authentication-Results"].startswith("amazonses.com;")
     assert "dkim=pass header.i=@mg.mercury.com" in h["Authentication-Results"]
-    assert h["ARC-Authentication-Results"].startswith("i=2;")
-    assert "d=mg.mercury.com" in h["DKIM-Signature"]
+    # Only the receiver's AR comes back: ARC and DKIM-Signature are never read on
+    # the raw path (review r1 F1/F2).
+    assert set(h) == {"Authentication-Results"}
 
 
 def test_dkim_raw_fallback_passes_on_real_merc_pet_and_cle_shapes():
@@ -504,10 +505,12 @@ def test_dkim_raw_fallback_fetch_failure_stays_unknown():
         assert r.verdict == "unknown" and r.strength == "unavailable"
 
 
-def test_dkim_raw_fallback_raw_without_auth_headers_stays_unknown():
+def test_dkim_raw_fallback_raw_without_auth_headers_is_fail():
+    # Real mail always carries SES's stamp; a raw message with none can't vouch for
+    # itself. It fails (-> near-miss ping) rather than qualifying on authed alone.
     raw = b"From: hello@mercury.com\r\nTo: finance+cle@staygoldenhi.com\r\nSubject: x\r\n\r\nbody"
     r = pl.dkim_check({}, [], "message.received", raw_fetch=lambda: raw)
-    assert r.verdict == "unknown" and r.strength == "unavailable"
+    assert r.verdict == "fail" and r.strength == "no-receiver-ar"
     assert r.source == "raw-fallback"
 
 
@@ -554,3 +557,84 @@ def test_evaluate_does_not_fetch_raw_for_non_payment_shaped_mail():
     d = pl.evaluate(["cort@staygoldenhawaii.com"], {}, "🎄 From $12: Watercolor winter",
                     [], "message.received", raw_fetch=must_not_run)
     assert d.qualified is False and d.dkim.verdict == "unknown"
+
+
+# --- review r1 F1: an explicit AR verdict outranks signature presence ----------
+# DKIM-Signature is never cryptographically verified here, so a fabricated
+# d=mg.mercury.com plus AgentMail's authed bit (the attacker's OWN domain
+# authenticated fine) must not beat the receiver saying dkim=fail.
+
+_SUBJ = "Golden Hour Studios Inc. sent you $40,099.92"
+_FAKE_SIG = b"DKIM-Signature: v=1; a=rsa-sha256; d=mg.mercury.com; s=pic; b=forged\r\n"
+
+
+def _raw(*lines: bytes) -> bytes:
+    return b"".join(lines) + b"From: hello@mercury.com\r\n\r\nbody"
+
+
+def test_raw_ar_dkim_fail_plus_fabricated_sig_does_not_qualify():
+    raw = _raw(b"Authentication-Results: amazonses.com; spf=pass; dkim=fail "
+               b"header.i=@mg.mercury.com\r\n", _FAKE_SIG)
+    d = pl.evaluate([], _BLIND_PARSED_CLE, _SUBJ, [], "message.received", raw_fetch=lambda: raw)
+    assert d.dkim.verdict == "fail" and d.dkim.strength == "present-no-match"
+    assert d.qualified is False and pl.is_payment_shaped(d)  # -> near-miss ping
+
+
+def test_raw_ar_attacker_domain_pass_plus_fabricated_sig_does_not_qualify():
+    raw = _raw(b"Authentication-Results: amazonses.com; spf=pass; dkim=pass "
+               b"header.i=@attacker.example\r\n", _FAKE_SIG)
+    d = pl.evaluate([], _BLIND_PARSED_CLE, _SUBJ, [], "message.received", raw_fetch=lambda: raw)
+    assert d.dkim.verdict == "fail" and d.qualified is False
+
+
+def test_raw_fabricated_sig_alone_never_passes():
+    d = pl.evaluate([], _BLIND_PARSED_CLE, _SUBJ, [], "message.received",
+                    raw_fetch=lambda: _raw(_FAKE_SIG))
+    assert d.dkim.verdict == "fail" and d.qualified is False
+
+
+def test_parsed_ar_fail_outranks_signature_tier():
+    # Parsed path keeps the sig tier, but only when there is no AR at all.
+    for ar in ("mx.google.com; dkim=fail header.i=@mg.mercury.com",
+               "mx.google.com; dkim=pass header.i=@attacker.example"):
+        h = {"Authentication-Results": ar,
+             "DKIM-Signature": "v=1; a=rsa-sha256; d=mg.mercury.com; s=pic"}
+        r = pl.dkim_check(h, [], "message.received")
+        assert r.verdict == "fail" and r.strength == "present-no-match", ar
+        d = pl.evaluate(["finance+cle@staygoldenhi.com"], h, _SUBJ, [], "message.received")
+        assert d.qualified is False
+
+
+# --- review r1 F2: the raw AR is anchored on a known receiver ------------------
+
+def test_raw_fabricated_topmost_ar_from_unknown_authserv_is_not_trusted():
+    raw = _raw(b"Authentication-Results: evil.example; dkim=pass header.i=@mg.mercury.com\r\n")
+    assert pl.raw_auth_headers(raw) == {}
+    d = pl.evaluate([], _BLIND_PARSED_CLE, _SUBJ, [], "message.received", raw_fetch=lambda: raw)
+    assert d.dkim.verdict == "fail" and d.dkim.strength == "no-receiver-ar"
+    assert d.qualified is False
+
+
+def test_raw_skips_untrusted_ar_and_takes_first_receiver_stamp():
+    # A forged AR ABOVE the receiver's (no real hop puts one there, but scan order
+    # must not care): the evil.example pass is skipped, SES's fail decides.
+    raw = _raw(b"Authentication-Results: evil.example; dkim=pass header.i=@mg.mercury.com\r\n",
+               b"Authentication-Results: amazonses.com; dkim=fail header.i=@mg.mercury.com\r\n")
+    assert pl.raw_auth_headers(raw)["Authentication-Results"].startswith("amazonses.com;")
+    r = pl.dkim_check(_BLIND_PARSED_CLE, [], "message.received", raw_fetch=lambda: raw)
+    assert r.verdict == "fail"
+
+
+def test_raw_forged_high_instance_arc_is_ignored():
+    raw = _raw(b"ARC-Authentication-Results: i=999; mx.google.com; dkim=pass "
+               b"header.i=@mg.mercury.com\r\n")
+    assert pl.raw_auth_headers(raw) == {}
+    d = pl.evaluate([], _BLIND_PARSED_CLE, _SUBJ, [], "message.received", raw_fetch=lambda: raw)
+    assert d.dkim.verdict == "fail" and d.qualified is False
+
+
+def test_authserv_id_parsing():
+    assert pl._authserv_id("amazonses.com; spf=pass") == "amazonses.com"
+    assert pl._authserv_id("  MX.Google.com 1; dkim=pass") == "mx.google.com"
+    assert pl._authserv_id("amazonses.com.evil.example; dkim=pass") == "amazonses.com.evil.example"
+    assert pl._authserv_id("") == ""
