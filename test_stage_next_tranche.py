@@ -9,6 +9,8 @@ nothing here touches a real base.
 from __future__ import annotations
 
 import copy
+import threading
+import time
 
 import pytest
 
@@ -216,3 +218,153 @@ def test_other_ratios_compute_exactly():
     assert p.action == "stage" and p.amount_cents == 123456
     p = _plan(_with(INV89, **{"Payment Terms": "40/60", "Invoice Amount": 2000}), [])
     assert p.action == "stage" and p.amount_cents == 300000
+
+
+# --- review r1 F3: read -> check -> create is serialized -------------------------
+
+class LinkingAirtable(FakeAirtable):
+    """create() also links the new invoice back onto its PO (as Airtable's reverse
+    link does) and mints a fresh id; get() yields so racing threads interleave."""
+    def __init__(self, records, barrier=None):
+        super().__init__(records)
+        self._lock = threading.Lock()
+        self.barrier = barrier  # unlocked race: both runs pass the check before either creates
+
+    def get(self, table, rec):
+        time.sleep(0.01)
+        with self._lock:
+            return super().get(table, rec)
+
+    def create(self, table, fields):
+        if self.barrier:
+            self.barrier.wait()
+        with self._lock:
+            n = len(self.created)
+            rec_id, inv_id = f"recNEW{n}", 93 + n
+            self.created.append((table, fields))
+            self.records[rec_id] = {"id": rec_id, "fields": {**fields, "Invoice ID": inv_id}}
+            self.records[PO_ID]["fields"]["Invoice"].append(rec_id)
+            return copy.deepcopy(self.records[rec_id])
+
+
+def _race(at, lock_path):
+    out = []
+
+    def one():
+        if lock_path is None:
+            out.append(st.run(at, INV89["id"], "10/16/2026", dry_run=False))
+        else:
+            with st.tranche_lock(lock_path, timeout=10):
+                out.append(st.run(at, INV89["id"], "10/16/2026", dry_run=False))
+
+    ts = [threading.Thread(target=one) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return sorted(line.split(" ")[1] for _, line in out)
+
+
+def test_unlocked_race_duplicates_which_is_why_the_lock_exists():
+    at = LinkingAirtable([INV89, _po([INV89["id"]])], barrier=threading.Barrier(2, timeout=5))
+    _race(at, None)
+    assert len(at.created) == 2  # the verified $40,099.92 duplicate
+
+
+def test_locked_race_stages_once_and_the_second_run_noops(tmp_path):
+    at = LinkingAirtable([INV89, _po([INV89["id"]])])
+    assert _race(at, tmp_path / "tranche-stage.prod.lock") == ["NOOP", "STAGED"]
+    assert len(at.created) == 1
+    notes = at.records[PO_ID]["fields"]["Notes"]
+    assert notes.count("staged at Estimate") == 1
+
+
+def test_lock_timeout_raises_and_main_creates_nothing(tmp_path, monkeypatch, capsys):
+    lock = tmp_path / "tranche-stage.prod.lock"
+    monkeypatch.setattr(st, "LOCK_DIR", tmp_path)
+    monkeypatch.setattr(st, "LOCK_TIMEOUT_S", 0.3)
+    monkeypatch.setenv("AIRTABLE_PAT", "pat")
+    monkeypatch.setenv("AIRTABLE_BASE_PROD", "appX")
+
+    def must_not_run(*a, **k):
+        raise AssertionError("ran without the lock")
+    monkeypatch.setattr(st, "run", must_not_run)
+    with st.tranche_lock(lock, timeout=1):
+        with pytest.raises(TimeoutError):
+            with st.tranche_lock(lock, timeout=0.3):
+                pass
+        assert st.main(["--base", "prod", "--invoice", INV89["id"]]) == 1
+    assert capsys.readouterr().out.startswith("TRANCHE ERROR")
+
+
+# --- review r1 F4: the PO note append survives an intervening writer ---------------
+
+def test_note_written_between_check_and_patch_survives():
+    other = "10/16/2026: Rony: balance due on arrival (manual)"
+
+    class Intervening(FakeAirtable):
+        def create(self, table, fields):
+            # Another writer appends to the PO after our first GET, before our PATCH.
+            self.records[PO_ID]["fields"]["Notes"] += other + "\n"
+            return super().create(table, fields)
+
+    at = Intervening([INV89, _po([INV89["id"]])])
+    code, line = st.run(at, INV89["id"], "10/16/2026", dry_run=False)
+    assert code == 0 and line.startswith("TRANCHE STAGED")
+    notes = at.records[PO_ID]["fields"]["Notes"]
+    assert other in notes and "INV#93 staged at Estimate" in notes
+    assert notes.startswith(PO_NOTES)
+
+
+# --- review r1 F5: a NOOP repairs the note a PARTIAL run left missing --------------
+
+def test_partial_then_rerun_repairs_the_po_note_exactly_once():
+    class FlakyOnce(FakeAirtable):
+        fail = True
+
+        def create(self, table, fields):
+            rec = super().create(table, fields)
+            self.records[PO_ID]["fields"]["Invoice"].append(rec["id"])
+            return rec
+
+        def patch(self, *a, **k):
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("422")
+            return super().patch(*a, **k)
+
+    at = FlakyOnce([INV89, _po([INV89["id"]])])
+    code, line = st.run(at, INV89["id"], "10/16/2026", dry_run=False)
+    assert code == 1 and line.startswith("TRANCHE PARTIAL")
+    assert "staged at Estimate" not in at.records[PO_ID]["fields"]["Notes"]
+
+    code, line = st.run(at, INV89["id"], "10/17/2026", dry_run=False)
+    assert code == 0 and line.startswith("TRANCHE NOOP (note repaired)"), line
+    notes = at.records[PO_ID]["fields"]["Notes"]
+    assert notes == PO_NOTES + ("10/17/2026: INV#93 staged at Estimate ($40,099.92, 70% balance "
+                                "per 30/70 terms on INV#89) (Cortana)\n")
+
+    code, line = st.run(at, INV89["id"], "10/17/2026", dry_run=False)
+    assert code == 0 and line.startswith("TRANCHE NOOP ") and "repaired" not in line
+    assert at.records[PO_ID]["fields"]["Notes"].count("staged at Estimate") == 1
+    assert len(at.created) == 1
+
+
+def test_noop_leaves_hand_staged_estimate_notes_alone():
+    # INV#92 was staged by hand (no helper invoice note): the NOOP must not write
+    # a PO line claiming the helper staged it. (Same as the golden test, explicit.)
+    at = FakeAirtable([INV89, INV92, _po([INV89["id"], INV92["id"]])])
+    code, line = st.run(at, INV89["id"], "10/16/2026", dry_run=False)
+    assert line.startswith("TRANCHE NOOP ") and at.patched == []
+
+
+def test_noop_repair_skipped_on_dry_run():
+    staged = _with(INV92, Notes="10/16/2026: 70% balance tranche of 30/70 on GPO#47-CLE — "
+                                "Estimate staged from INV#89 ($17,185.68 × 70/30 = $40,099.92) "
+                                "(Cortana)")
+    at = FakeAirtable([INV89, staged, _po([INV89["id"], INV92["id"]])])
+    code, line = st.run(at, INV89["id"], "10/16/2026", dry_run=True)
+    assert line.startswith("TRANCHE NOOP ") and at.patched == []
+    code, line = st.run(at, INV89["id"], "10/16/2026", dry_run=False)
+    assert line.startswith("TRANCHE NOOP (note repaired)")
+    assert "INV#92 staged at Estimate ($40,099.92" in at.records[PO_ID]["fields"]["Notes"]

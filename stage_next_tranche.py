@@ -19,7 +19,15 @@ on the PO (a separately-invoiced on-receipt item moves the split base onto the
 open balance — playbook lesson 2026-08-07) produce a FLAG line for the session
 to escalate. A guessed estimate is worse than none.
 
-Idempotent: a sibling invoice at seq + 1 in any status means NOOP.
+Idempotent: a sibling invoice at seq + 1 in any status means NOOP. When that
+sibling is one this helper staged (Estimate, carrying the helper's invoice note)
+and the PO note naming it is missing — a prior run that ended PARTIAL — the NOOP
+appends the missing PO line and says `NOOP (note repaired)`.
+
+Concurrency: the whole read -> check -> create -> note sequence runs under an
+exclusive flock on CC_HOME/tranche-stage.<base>.lock, so two runs on one box can't
+both see "no seq 2" and both create. A run that can't get the lock within
+TRANCHE_LOCK_TIMEOUT seconds creates nothing and prints TRANCHE ERROR.
 
 Output is one line, `TRANCHE <STAGED|NOOP|SKIP|FLAG> ...`. Exit 0 for
 STAGED/NOOP/SKIP, 3 for FLAG (escalate), 1 for an error (nothing or a partial
@@ -30,12 +38,15 @@ PAT + REST per the house posture, never the Airtable MCP.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -50,6 +61,9 @@ API = "https://api.airtable.com/v0"
 INVOICES = "tbljxLxn2XnwF5gT8"
 PURCHASE_ORDERS = "tblIrbt8qjhEuhKpv"
 
+LOCK_DIR = pathlib.Path(os.environ.get("CC_HOME", pathlib.Path.home() / ".agentmail-cc"))
+LOCK_TIMEOUT_S = float(os.environ.get("TRANCHE_LOCK_TIMEOUT", "120"))
+
 _SPLIT_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
 
 
@@ -60,6 +74,7 @@ class Plan:
     fields: dict = field(default_factory=dict)   # the new invoice, when staging
     amount_cents: int = 0
     pct: int = 0
+    sibling: dict = field(default_factory=dict)  # the existing seq-2 invoice, on noop
 
 
 def _cents(value) -> int | None:
@@ -121,7 +136,7 @@ def plan_next_tranche(paid: dict, po_invoices: list[dict], po_name: str, note_da
     if nxt:
         n = nxt[0]
         return Plan("noop", f"{_label(n)} ({n['id']}) already holds seq 2 "
-                            f"[{n.get('fields', {}).get('Payment Status')}]")
+                            f"[{n.get('fields', {}).get('Payment Status')}]", sibling=n)
     if others:
         listed = ", ".join(
             f"{_label(i)} seq={i.get('fields', {}).get('Invoice Seq')!r} "
@@ -155,6 +170,51 @@ def plan_next_tranche(paid: dict, po_invoices: list[dict], po_name: str, note_da
         fields["Invoice PDF"] = pdf
     return Plan("stage", f"{second}% balance of {terms}", fields=fields,
                 amount_cents=amount, pct=second)
+
+
+def po_note_line(note_date: str, staged: dict, paid: dict) -> str:
+    """The PO Notes line recording a staged balance invoice. Built from the staged
+    record itself so a NOOP repair writes the same line the staging run would have."""
+    sf = staged.get("fields", {})
+    terms = sf.get("Payment Terms") or ""
+    m = _SPLIT_RE.match(terms)
+    pct = int(m.group(2)) if m else 0
+    return (f"{note_date}: {_short(staged)} staged at Estimate "
+            f"({fmt_usd(_cents(sf.get('Invoice Amount')) or 0)}, {pct}% balance per {terms} "
+            f"terms on {_short(paid)}) (Cortana)")
+
+
+def needs_note_repair(sibling: dict, paid: dict, po_notes: str | None) -> bool:
+    """True when `sibling` is an Estimate this helper staged (its own Notes carry the
+    helper's "Estimate staged from INV#NN (" line) but the PO Notes never got the
+    line naming it — the PARTIAL leftover. Hand-staged Estimates are left alone."""
+    sf = sibling.get("fields", {})
+    if sf.get("Payment Status") != "Estimate":
+        return False
+    if f"Estimate staged from {_short(paid)} (" not in (sf.get("Notes") or ""):
+        return False
+    return f"{_short(sibling)} staged at Estimate" not in (po_notes or "")
+
+
+@contextlib.contextmanager
+def tranche_lock(path: pathlib.Path, timeout: float):
+    """Exclusive flock on `path`, polled until `timeout` seconds; TimeoutError if
+    another run still holds it. Released when the block exits (or the process dies)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"{path} still held after {timeout:g}s") from None
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def append_note(existing: str | None, line: str) -> str:
@@ -210,6 +270,16 @@ def run(at: Airtable, invoice_id: str, note_date: str, dry_run: bool) -> tuple[i
     head = f"{_label(paid)} on {po_name}"
     if plan.action == "flag":
         return 3, f"TRANCHE FLAG {head}: {plan.reason}"
+    if plan.action == "noop" and not dry_run:
+        fresh = at.get(PURCHASE_ORDERS, po["id"])  # re-read right before the append
+        notes = fresh.get("fields", {}).get("Notes")
+        if needs_note_repair(plan.sibling, paid, notes):
+            line = po_note_line(note_date, plan.sibling, paid)
+            try:
+                at.patch(PURCHASE_ORDERS, po["id"], {"Notes": append_note(notes, line)})
+            except Exception as e:
+                return 1, f"TRANCHE ERROR {head}: {plan.reason}; PO note repair failed: {e}"
+            return 0, f"TRANCHE NOOP (note repaired) {head}: {plan.reason}"
     if plan.action in ("noop", "skip"):
         return 0, f"TRANCHE {plan.action.upper()} {head}: {plan.reason}"
 
@@ -219,12 +289,12 @@ def run(at: Airtable, invoice_id: str, note_date: str, dry_run: bool) -> tuple[i
         return 0, f"TRANCHE DRY-RUN {head}: would stage {what}; fields={json.dumps(shown, ensure_ascii=False)}"
 
     created = at.create(INVOICES, plan.fields)
-    new_label = f"INV#{created.get('fields', {}).get('Invoice ID', '?')}"
-    po_line = (f"{note_date}: {new_label} staged at Estimate ({fmt_usd(plan.amount_cents)}, "
-               f"{plan.pct}% balance per {plan.fields['Payment Terms']} terms on "
-               f"{_short(paid)}) (Cortana)")
+    new_label = _short(created)
+    po_line = po_note_line(note_date, created, paid)
     try:
-        fresh = at.get(PURCHASE_ORDERS, po["id"])  # re-read right before the append
+        # Re-read right before the append so a note another writer added since the
+        # first GET survives (the lock only serializes helper runs).
+        fresh = at.get(PURCHASE_ORDERS, po["id"])
         at.patch(PURCHASE_ORDERS, po["id"],
                  {"Notes": append_note(fresh.get("fields", {}).get("Notes"), po_line)})
     except Exception as e:
@@ -260,8 +330,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"TRANCHE ERROR: AIRTABLE_PAT / base id for {a.base} missing ({ENV_FILE})")
         return 1
     note_date = a.date or dt.datetime.now(NOTE_TZ).strftime("%m/%d/%Y")
+    lock = LOCK_DIR / f"tranche-stage.{a.base}.lock"
     try:
-        code, line = run(Airtable(pat, base), a.invoice, note_date, a.dry_run)
+        with tranche_lock(lock, LOCK_TIMEOUT_S):
+            code, line = run(Airtable(pat, base), a.invoice, note_date, a.dry_run)
+    except TimeoutError as e:
+        code, line = 1, f"TRANCHE ERROR {a.invoice}: lock busy, nothing created ({e})"
     except Exception as e:
         code, line = 1, f"TRANCHE ERROR {a.invoice}: {e}"
     print(line)
